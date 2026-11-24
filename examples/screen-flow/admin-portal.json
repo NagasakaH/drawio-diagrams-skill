@@ -1,0 +1,262 @@
+{
+  "title": "管理ポータル 画面遷移図",
+  "subtitle": "運営スタッフが注文を処理するまでの導線 — Public / Authenticated の区分と、権限エラー・モーダル・完了通知の分岐を示す",
+  "groups": [
+    {
+      "id": "public",
+      "label": "認証前 (Public)",
+      "kind": "access"
+    },
+    {
+      "id": "auth",
+      "label": "認証後 (Authenticated)",
+      "kind": "access"
+    }
+  ],
+  "screens": [
+    {
+      "id": "login",
+      "name": "ログイン",
+      "route": "/login",
+      "group": "public",
+      "elements": [
+        "従業員メール / パスワード入力",
+        "SSO (Google Workspace) ボタン",
+        "エラーメッセージ領域",
+        "「パスワードを忘れた場合」リンク"
+      ],
+      "note": "セッション未保持の人は必ずここへ送られる",
+      "row": 1,
+      "col": 0
+    },
+    {
+      "id": "sso",
+      "name": "SSO プロバイダー",
+      "route": "accounts.example.com",
+      "kind": "external",
+      "group": "public",
+      "elements": [
+        "Google アカウント選択",
+        "認可画面 (scopes 確認)"
+      ],
+      "note": "外部ドメインへ離脱する",
+      "row": 0,
+      "col": 1
+    },
+    {
+      "id": "forbidden",
+      "name": "権限なし (403)",
+      "route": "/403",
+      "kind": "error",
+      "group": "public",
+      "elements": [
+        "不足権限の名前を表示",
+        "管理者への申請フォームリンク",
+        "トップへ戻るボタン"
+      ],
+      "note": "readonly ロールの人が管理画面を開いたとき",
+      "row": 2,
+      "col": 1
+    },
+    {
+      "id": "dashboard",
+      "name": "ダッシュボード",
+      "route": "/dashboard",
+      "group": "auth",
+      "elements": [
+        "本日の注文数 / 売上 KPI",
+        "未処理アラート一覧",
+        "クイックリンク（注文一覧・返金）"
+      ],
+      "note": "デフォルトのランディング画面",
+      "row": 1,
+      "col": 2
+    },
+    {
+      "id": "orders",
+      "name": "注文一覧",
+      "route": "/orders",
+      "group": "auth",
+      "elements": [
+        "検索フォーム（注文番号・メール）",
+        "ステータス / 期間フィルタ",
+        "注文テーブル（ページネーション）",
+        "CSV エクスポートボタン"
+      ],
+      "note": "1 ページ 50 件、URL クエリで状態を共有できる",
+      "row": 1,
+      "col": 3
+    },
+    {
+      "id": "orderDetail",
+      "name": "注文詳細",
+      "route": "/orders/:id",
+      "group": "auth",
+      "elements": [
+        "注文ヘッダー（ステータス・購入者）",
+        "明細テーブルと金額内訳",
+        "タイムライン（決済 / 出荷 / 問い合わせ）",
+        "操作ボタン: 返金 / ステータス変更"
+      ],
+      "note": "操作は orders:write 権限が必要",
+      "row": 1,
+      "col": 4
+    },
+    {
+      "id": "refundModal",
+      "name": "返金確認",
+      "route": "modal · /orders/:id/refund",
+      "kind": "modal",
+      "group": "auth",
+      "elements": [
+        "返金金額（全額 / 部分）",
+        "返金理由のセレクト",
+        "再入力による確定ボタン"
+      ],
+      "note": "Esc またはオーバーレイクリックで閉じる",
+      "row": 0,
+      "col": 5
+    },
+    {
+      "id": "statusModal",
+      "name": "ステータス編集",
+      "route": "modal · /orders/:id/status",
+      "kind": "modal",
+      "group": "auth",
+      "elements": [
+        "遷移先ステータスの選択",
+        "運営メモの textarea",
+        "在庫への影響プレビュー"
+      ],
+      "row": 2,
+      "col": 4
+    },
+    {
+      "id": "refundError",
+      "name": "返金エラー",
+      "route": "toast · refund.failed",
+      "kind": "error",
+      "group": "auth",
+      "elements": [
+        "Stripe エラーコードを表示",
+        "再試行ボタン",
+        "Sentry へ障害レポート"
+      ],
+      "row": 3,
+      "col": 5
+    },
+    {
+      "id": "doneToast",
+      "name": "完了通知",
+      "route": "toast · order.updated",
+      "kind": "screen",
+      "group": "auth",
+      "elements": [
+        "更新後のステータス",
+        "元に戻す (undo) 5 秒間",
+        "注文詳細へ戻るリンク"
+      ],
+      "note": "操作成功時に画面右下へ表示",
+      "row": 1,
+      "col": 6
+    }
+  ],
+  "transitions": [
+    {
+      "from": "login",
+      "to": "sso",
+      "label": "SSO でログイン",
+      "kind": "external"
+    },
+    {
+      "from": "sso",
+      "to": "dashboard",
+      "label": "認可成功 / redirect",
+      "kind": "normal"
+    },
+    {
+      "from": "login",
+      "to": "dashboard",
+      "label": "ログイン成功",
+      "kind": "normal"
+    },
+    {
+      "from": "login",
+      "to": "login",
+      "label": "パスワード誤り / 再表示",
+      "kind": "error"
+    },
+    {
+      "from": "dashboard",
+      "to": "forbidden",
+      "label": "管理 API が 403",
+      "kind": "error"
+    },
+    {
+      "from": "dashboard",
+      "to": "orders",
+      "label": "注文一覧を開く",
+      "kind": "normal"
+    },
+    {
+      "from": "orders",
+      "to": "orderDetail",
+      "label": "行をクリック",
+      "kind": "normal"
+    },
+    {
+      "from": "orderDetail",
+      "to": "orders",
+      "label": "戻る / パンくず",
+      "kind": "normal"
+    },
+    {
+      "from": "orderDetail",
+      "to": "refundModal",
+      "label": "返金ボタン",
+      "kind": "modal"
+    },
+    {
+      "from": "orderDetail",
+      "to": "statusModal",
+      "label": "ステータス変更",
+      "kind": "modal"
+    },
+    {
+      "from": "refundModal",
+      "to": "doneToast",
+      "label": "返金確定 / 200",
+      "kind": "normal"
+    },
+    {
+      "from": "refundModal",
+      "to": "refundError",
+      "label": "決済 API が失敗",
+      "kind": "error"
+    },
+    {
+      "from": "statusModal",
+      "to": "doneToast",
+      "label": "更新確定 / 200",
+      "kind": "normal"
+    },
+    {
+      "from": "statusModal",
+      "to": "orderDetail",
+      "label": "キャンセル / Esc",
+      "kind": "modal"
+    },
+    {
+      "from": "doneToast",
+      "to": "orderDetail",
+      "label": "詳細へ戻る",
+      "kind": "normal"
+    },
+    {
+      "from": "refundError",
+      "to": "refundModal",
+      "label": "再試行",
+      "kind": "error"
+    }
+  ]
+}

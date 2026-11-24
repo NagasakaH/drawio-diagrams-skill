@@ -1,0 +1,183 @@
+{
+  "title": "EC 注文ライフサイクル（状態遷移図）",
+  "subtitle": "Order 集約のライフサイクル — 正常系は DRAFT → DELIVERED、決済失敗・キャンセル・返金は異常系遷移で分岐",
+  "groups": [
+    { "id": "fulfillment", "label": "FULFILLING 出荷処理 (composite state)" }
+  ],
+  "states": [
+    { "id": "start", "kind": "initial", "row": 0, "col": 0 },
+    {
+      "id": "DRAFT",
+      "name": "DRAFT",
+      "semantic": "normal",
+      "entry": "カート合計を計算",
+      "do": "在庫を 30 分仮確保",
+      "row": 0,
+      "col": 1
+    },
+    {
+      "id": "PLACED",
+      "name": "PLACED",
+      "semantic": "active",
+      "entry": "order_no 採番 / 在庫を確定",
+      "row": 0,
+      "col": 2
+    },
+    {
+      "id": "PAYMENT_FAILED",
+      "name": "PAYMENT_FAILED",
+      "semantic": "warning",
+      "entry": "決済エラーを記録",
+      "do": "再決済メールを送信",
+      "row": 1,
+      "col": 2
+    },
+    {
+      "id": "PAID",
+      "name": "PAID",
+      "semantic": "success",
+      "entry": "paid_at 記録 / 領収書発行",
+      "row": 0,
+      "col": 3
+    },
+    {
+      "id": "PACKED",
+      "name": "PACKED",
+      "semantic": "active",
+      "group": "fulfillment",
+      "entry": "ピッキング完了を記録",
+      "row": 0,
+      "col": 4
+    },
+    {
+      "id": "SHIPPED",
+      "name": "SHIPPED",
+      "semantic": "active",
+      "group": "fulfillment",
+      "entry": "tracking_no を送客",
+      "do": "配送状況ポーリング",
+      "row": 0,
+      "col": 5
+    },
+    {
+      "id": "DELIVERED",
+      "name": "DELIVERED",
+      "semantic": "success",
+      "entry": "受領日時を記録 / ポイント付与",
+      "row": 0,
+      "col": 6
+    },
+    { "id": "end_delivered", "kind": "final", "row": 0, "col": 7 },
+    {
+      "id": "CANCELLED",
+      "name": "CANCELLED",
+      "semantic": "error",
+      "entry": "在庫を戻す / 注文をロック",
+      "exit": "取消メールを送信",
+      "row": 1,
+      "col": 1
+    },
+    { "id": "end_cancelled", "kind": "final", "row": 1, "col": 0 },
+    {
+      "id": "REFUND_REQUESTED",
+      "name": "REFUND_REQUESTED",
+      "semantic": "warning",
+      "entry": "返品受付番号を発番",
+      "do": "返品荷姿を案内",
+      "row": 2,
+      "col": 5
+    },
+    {
+      "id": "REFUNDED",
+      "name": "REFUNDED",
+      "semantic": "error",
+      "entry": "Stripe refund を実行",
+      "exit": "返金完了メールを送信",
+      "row": 2,
+      "col": 6
+    },
+    { "id": "end_refunded", "kind": "final", "row": 2, "col": 7 }
+  ],
+  "transitions": [
+    { "from": "start", "to": "DRAFT", "event": "cart.created", "kind": "normal" },
+    {
+      "from": "DRAFT",
+      "to": "PLACED",
+      "event": "checkout",
+      "guard": "在庫あり",
+      "action": "order_no 採番",
+      "kind": "normal"
+    },
+    {
+      "from": "DRAFT",
+      "to": "CANCELLED",
+      "event": "timeout",
+      "guard": "30 分経過",
+      "action": "仮確保を解放",
+      "kind": "cancel"
+    },
+    {
+      "from": "PLACED",
+      "to": "PAID",
+      "event": "payment.authorized",
+      "guard": "与信 OK",
+      "action": "paid_at = now()",
+      "kind": "normal"
+    },
+    {
+      "from": "PLACED",
+      "to": "PAYMENT_FAILED",
+      "event": "payment.declined",
+      "guard": "決済失敗",
+      "kind": "error"
+    },
+    {
+      "from": "PAYMENT_FAILED",
+      "to": "PLACED",
+      "event": "retry.payment",
+      "guard": "再決済から 24h 以内",
+      "kind": "retry"
+    },
+    {
+      "from": "PLACED",
+      "to": "CANCELLED",
+      "event": "cancel.requested",
+      "guard": "未払のみ",
+      "action": "在庫ロールバック",
+      "kind": "cancel"
+    },
+    {
+      "from": "PAID",
+      "to": "PACKED",
+      "event": "fulfillment.started",
+      "action": "出荷指示を発行",
+      "kind": "normal"
+    },
+    { "from": "PACKED", "to": "SHIPPED", "event": "shipment.handover", "action": "tracking_no 記録", "kind": "normal" },
+    {
+      "from": "SHIPPED",
+      "to": "DELIVERED",
+      "event": "delivery.confirmed",
+      "guard": "受領 OK",
+      "action": "ポイント付与",
+      "kind": "success"
+    },
+    { "from": "DELIVERED", "to": "end_delivered", "kind": "normal" },
+    {
+      "from": "DELIVERED",
+      "to": "REFUND_REQUESTED",
+      "event": "return.requested",
+      "guard": "返品期限 8 日以内",
+      "kind": "error"
+    },
+    {
+      "from": "REFUND_REQUESTED",
+      "to": "REFUNDED",
+      "event": "refund.approved",
+      "action": "全額返金",
+      "kind": "error"
+    },
+    { "from": "REFUNDED", "to": "end_refunded", "kind": "error" },
+    { "from": "CANCELLED", "to": "end_cancelled", "kind": "cancel" }
+  ]
+}

@@ -1,0 +1,207 @@
+{
+  "title": "注文ドメインモデル",
+  "subtitle": "UML クラス図 — DDD 風の注文ドメイン（examples/order-domain.json から生成）",
+  "packages": [
+    { "id": "domain", "label": "order.domain" },
+    { "id": "application", "label": "order.application (ports)" },
+    { "id": "infrastructure", "label": "order.infrastructure" }
+  ],
+  "classes": [
+    {
+      "id": "Customer",
+      "name": "Customer",
+      "stereotype": "entity",
+      "package": "domain",
+      "row": 0,
+      "col": 0,
+      "attributes": [
+        "- id: CustomerId",
+        "- name: string",
+        "- email: string"
+      ],
+      "methods": [
+        "+ rename(name: string): void",
+        "+ changeEmail(email: string): void"
+      ]
+    },
+    {
+      "id": "OrderRepository",
+      "name": "OrderRepository",
+      "stereotype": "interface",
+      "package": "application",
+      "row": 0,
+      "col": 2,
+      "methods": [
+        "+ save(order: Order): Promise<void>",
+        "+ findById(id: OrderId): Promise<Order | null>",
+        "+ findActiveByCustomer(c: Customer): Promise<Order[]>"
+      ]
+    },
+    {
+      "id": "PaymentProcessor",
+      "name": "PaymentProcessor",
+      "stereotype": "interface",
+      "package": "application",
+      "row": 0,
+      "col": 3,
+      "methods": [
+        "+ authorize(req: PaymentRequest): Promise<Money>",
+        "+ capture(orderId: OrderId): Promise<void>",
+        "+ refund(orderId: OrderId): Promise<void>"
+      ]
+    },
+    {
+      "id": "Order",
+      "name": "Order",
+      "stereotype": "entity",
+      "package": "domain",
+      "row": 1,
+      "col": 1,
+      "attributes": [
+        "- id: OrderId",
+        "- customer: Customer",
+        "- items: OrderItem[]",
+        "- status: OrderStatus",
+        "- total: Money",
+        "- placedAt: Date | null"
+      ],
+      "methods": [
+        "+ static draft(customer: Customer): Order",
+        "+ addItem(item: OrderItem): void",
+        "+ place(): void",
+        "+ cancel(reason: string): void",
+        "+ calculateTotal(): Money",
+        "+ isPlaced(): boolean"
+      ]
+    },
+    {
+      "id": "OrderItem",
+      "name": "OrderItem",
+      "stereotype": "entity",
+      "package": "domain",
+      "row": 1,
+      "col": 2,
+      "attributes": [
+        "- productId: ProductId",
+        "- quantity: number",
+        "- unitPrice: Money"
+      ],
+      "methods": [
+        "+ subtotal(): Money",
+        "+ changeQuantity(qty: number): void"
+      ]
+    },
+    {
+      "id": "StripePaymentProcessor",
+      "name": "StripePaymentProcessor",
+      "stereotype": "service",
+      "package": "infrastructure",
+      "row": 1,
+      "col": 3,
+      "attributes": [
+        "- secretKey: string",
+        "- apiVersion: string"
+      ],
+      "methods": [
+        "+ authorize(req: PaymentRequest): Promise<Money>",
+        "+ capture(orderId: OrderId): Promise<void>",
+        "+ refund(orderId: OrderId): Promise<void>"
+      ]
+    },
+    {
+      "id": "OrderStatus",
+      "name": "OrderStatus",
+      "stereotype": "enum",
+      "package": "domain",
+      "row": 2,
+      "col": 0,
+      "attributes": [
+        "DRAFT",
+        "PLACED",
+        "PAID",
+        "SHIPPED",
+        "CANCELLED"
+      ],
+      "methods": [
+        "+ canTransitionTo(next: OrderStatus): boolean"
+      ]
+    },
+    {
+      "id": "Money",
+      "name": "Money",
+      "stereotype": "value object",
+      "package": "domain",
+      "row": 2,
+      "col": 1,
+      "attributes": [
+        "- amount: number",
+        "- currency: Currency"
+      ],
+      "methods": [
+        "+ static of(amount: number, c: Currency): Money",
+        "+ add(other: Money): Money",
+        "+ multiply(factor: number): Money",
+        "+ isZero(): boolean"
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "from": "Order",
+      "to": "OrderItem",
+      "type": "composition",
+      "label": "contains",
+      "sourceMultiplicity": "1",
+      "targetMultiplicity": "1..*"
+    },
+    {
+      "from": "Order",
+      "to": "Money",
+      "type": "composition",
+      "label": "total",
+      "sourceMultiplicity": "1",
+      "targetMultiplicity": "1"
+    },
+    {
+      "from": "OrderItem",
+      "to": "Money",
+      "type": "association",
+      "label": "unitPrice",
+      "sourceMultiplicity": "1",
+      "targetMultiplicity": "1"
+    },
+    {
+      "from": "Order",
+      "to": "Customer",
+      "type": "association",
+      "label": "placedBy",
+      "sourceMultiplicity": "0..*",
+      "targetMultiplicity": "1"
+    },
+    {
+      "from": "Order",
+      "to": "OrderStatus",
+      "type": "aggregation",
+      "label": "has status",
+      "sourceMultiplicity": "1",
+      "targetMultiplicity": "1"
+    },
+    {
+      "from": "Order",
+      "to": "PaymentProcessor",
+      "type": "dependency",
+      "label": "charge via"
+    },
+    {
+      "from": "Order",
+      "to": "OrderRepository",
+      "type": "dependency",
+      "label": "persisted by"
+    },
+    {
+      "from": "StripePaymentProcessor",
+      "to": "PaymentProcessor",
+      "type": "implementation"
+    }
+  ]
+}

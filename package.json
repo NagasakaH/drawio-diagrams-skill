@@ -1,0 +1,11 @@
+{
+  "name": "drawio-diagrams-skill",
+  "version": "1.0.0",
+  "description": "Zero-dependency Node.js (.mjs) agent skill that generates eight kinds of draw.io diagrams (.drawio + embedded-XML .drawio.png): swimlane business workflows, AWS architecture from Terraform, UML sequence diagrams, UML class diagrams (TS/JS scanner), Crow's Foot ER diagrams (SQL DDL / Prisma scanner), UML state machine diagrams, C4 container diagrams, and screen-flow (UI navigation) maps",
+  "type": "module",
+  "scripts": {
+    "demo": "node scripts/drawio-cli.mjs workflow --spec examples/workflow/order-checkout-workflow.json --direction horizontal --output examples/output/workflow-horizontal.drawio.png && node scripts/drawio-cli.mjs aws-arch --tf-dir examples/aws-arch/sample-terraform --output examples/output/aws-arch-default.drawio.png --json-out examples/output/aws-arch-default.json && node scripts/drawio-cli.mjs sequence --spec examples/sequence/order-checkout.json --output examples/output/order-checkout-sequence.drawio.png && node scripts/drawio-cli.mjs class --spec examples/class/order-domain.json --output examples/output/order-domain-class.drawio.png && node scripts/drawio-cli.mjs er --schema examples/er/sample-schema/ecommerce.sql --output examples/output/ecommerce-er.drawio.png --json-out examples/output/ecommerce-er.json && node scripts/drawio-cli.mjs state --spec examples/state/order-lifecycle.json --output examples/output/order-lifecycle-state.drawio.png && node scripts/drawio-cli.mjs c4 --spec examples/c4/ecommerce-container.json --output examples/output/ecommerce-c4-container.drawio.png && node scripts/drawio-cli.mjs screen-flow --spec examples/screen-flow/admin-portal.json --output examples/output/admin-portal-screen-flow.drawio.png",
+    "test": "node --test tests/regression.test.mjs"
+  },
+  "license": "Apache-2.0"
+}

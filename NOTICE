@@ -1,0 +1,102 @@
+drawio-diagrams-skill
+
+This product bundles the shared converter `scripts/drawio2png.mjs` (used by all eight
+diagram builders), which includes third-party
+software and stencil/shape assets derived from:
+
+1. draw.io — https://github.com/jgraph/drawio/tree/v29.6.6 (tag v29.6.6)
+   and draw.io Desktop — https://github.com/jgraph/drawio-desktop
+   Copyright (c) 2006-2025, JGraph Holdings Ltd (draw.io Ltd)
+   Copyright (c) 2006-2025, draw.io AG
+   Licensed under the Apache License, Version 2.0
+   (https://www.apache.org/licenses/LICENSE-2.0).
+
+   `scripts/drawio2png.mjs` bundles the mxGraph / draw.io shape, stencil and
+   default-style assets taken from that tag (the minified `shapes.min.js`,
+   the stencil XML sets under `src/main/webapp/stencils`, the default and dark
+   style sheets, and the built-in shape code), recompressed for embedding.
+   The additional terms for icon sets and stencil libraries quoted below apply
+   to those assets.
+
+2. @resvg/resvg-wasm — https://github.com/thx/resvg-js/tree/v2.6.2
+   (npm package `@resvg/resvg-wasm`, version 2.6.2)
+   Copyright (c) 2019 - 2023, the resvg-js authors
+   Licensed under the Mozilla Public License, Version 2.0
+   (the full license text is available at
+   https://www.mozilla.org/en-US/MPL/2.0/).
+
+   The embedded WebAssembly binary (`index_bg.wasm` of the npm package) is an
+   unmodified, base64-encoded copy of the build artifact published in npm
+   `@resvg/resvg-wasm@2.6.2`, stored inside `scripts/drawio2png.mjs` so the
+   converter runs offline with zero installation.
+
+   The wasm-bindgen JavaScript glue code from that package (originally
+   published as `index.mjs` / `index.js`, together with `wasm-binding.ts`) is
+   NOT kept as a separate file: it was integrated directly into
+   `scripts/drawio2png.mjs` as executable JavaScript, so it is a MODIFIED
+   version of the original MPL-2.0 Source Code Form. The modifications: the
+   package's public asynchronous entry point (which loads `index_bg.wasm` from
+   a file path or network URL) is not used -- the converter instead decodes the
+   base64 blob above and instantiates it synchronously with
+   `new WebAssembly.Module/Instance`, feeding the result into the glue's
+   `__wbg_finalize_init`; the module wrapper was unwrapped and the glue was
+   renamed to internal converter symbols. The original unused fetch/file-
+   loading glue lines are otherwise retained verbatim.
+
+   SCOPE OF THE MPL-2.0 COVERED SOFTWARE. Inside `scripts/drawio2png.mjs` the
+   MPL-2.0 part is delimited by the two comment markers
+
+       // BEGIN MPL-2.0 COVERED SOFTWARE (@resvg/resvg-wasm v2.6.2)
+       // END MPL-2.0 COVERED SOFTWARE (@resvg/resvg-wasm v2.6.2)
+
+   Everything between those markers (the base64-encoded, unmodified
+   `index_bg.wasm` and the wasm-bindgen JavaScript glue adapted for
+   synchronous initialization) is MPL-2.0 covered software. These
+   modifications remain under MPL-2.0 and this project does not relicense them.
+
+   WHERE THE SOURCE CODE FORM OF THE MODIFIED VERSION IS AVAILABLE. The
+   modified Source Code Form is distributed with this product: the block
+   between the BEGIN / END markers inside `scripts/drawio2png.mjs` -- this very
+   file, as shipped in this repository / distribution archive -- is itself the
+   Source Code Form of the modified glue. It is readable, unobfuscated,
+   uncompressed JavaScript, so no additional download is needed to obtain the
+   modified version. The unmodified upstream Source Code Form of the same
+   version remains available at
+   https://github.com/thx/resvg-js/tree/v2.6.2 (npm `@resvg/resvg-wasm@2.6.2`),
+   and the full MPL-2.0 text at https://www.mozilla.org/en-US/MPL/2.0/.
+
+   `scripts/drawio2png.mjs` as a whole is therefore a Larger Work / Combined
+   distribution in the sense of MPL-2.0 section 3.3: the Apache-2.0 part (the
+   wrapper / converter code and the draw.io assets described under item 1) and
+   the MPL-2.0 part described above are distributed together in one file, and
+   each part continues to be governed by its own license.
+
+================================================================================
+ADDITIONAL TERMS FOR ICON SETS AND STENCIL LIBRARIES
+================================================================================
+
+From `drawio/src/main/webapp/stencils/LICENSE` and `drawio/src/main/webapp/shapes/LICENSE`:
+
+> The icon sets and stencil libraries included in this software, and any
+> derivatives thereof (including conversions to other formats, traced
+> reproductions, substantially similar visual representations, or AI-generated
+> images created using these icons as reference or training input), may not be
+> used as software assets in, distributed for use with, or incorporated into
+> Atlassian products or products distributed through the Atlassian marketplace
+> or plugin ecosystem, without explicit written permission.
+>
+> This restriction does not apply to end-user diagram output (such as exported
+> images or documents) created using this software.
+
+Third-party architecture icons included in the stencil libraries (such as AWS,
+Google Cloud Platform, Microsoft Azure, Kubernetes, Cisco, IBM, etc.) are the
+trademarks and/or copyrighted property of their respective owners.
+
+================================================================================
+TRADEMARK DISCLAIMER
+================================================================================
+
+"draw.io" is a registered EU trademark (#018062448) of draw.io AG.
+This project (`drawio-diagrams-skill`) is an independent, unofficial open-source
+skill and is NOT affiliated with, endorsed by, or sponsored by draw.io Ltd
+(JGraph) or draw.io AG.

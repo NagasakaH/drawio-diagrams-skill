@@ -1,0 +1,79 @@
+{
+  "title": "EC 注文・決済フロー (Order Checkout Sequence)",
+  "subtitle": "注文確定から決済承認・DB 確定・非同期通知までの時系列 — 例: order_id 10428 / ¥3,980",
+  "autonumber": true,
+  "spacing": 220,
+  "rowHeight": 46,
+  "legend": true,
+  "participants": [
+    { "id": "user", "name": "Customer", "kind": "actor", "sub": "Web / App 利用者" },
+    { "id": "web", "name": "Web UI", "kind": "client", "sub": "Next.js (SPA)" },
+    { "id": "api", "name": "Order API", "kind": "service", "sub": "Node.js / ECS Fargate" },
+    { "id": "pay", "name": "Payment Gateway", "kind": "external", "sub": "外部決済 SaaS (Stripe 等)" },
+    { "id": "db", "name": "Orders DB", "kind": "database", "sub": "Aurora PostgreSQL" },
+    { "id": "queue", "name": "Notification Queue", "kind": "queue", "sub": "SQS → Lambda" }
+  ],
+  "messages": [
+    { "from": "user", "to": "web", "type": "sync", "label": "注文を確定（カート 3 点 / ¥3,980）" },
+    { "from": "web", "to": "api", "type": "sync", "activate": true, "label": "POST /api/v1/checkout {cart, payment_token}", "gap": 56 },
+    { "from": "api", "to": "db", "type": "sync", "label": "BEGIN; INSERT orders (status=pending)" },
+    { "from": "db", "to": "api", "type": "reply", "label": "order_id = 10428" },
+    { "from": "api", "to": "pay", "type": "sync", "activate": true, "label": "authorize(order_id, ¥3,980)", "gap": 20 },
+    { "from": "pay", "to": "api", "type": "reply", "label": "承認 OK (auth_code=8F2K)" },
+    { "from": "api", "to": "api", "type": "sync", "label": "402 時: status=failed・在庫ロールバック", "gap": 30 },
+    { "from": "api", "to": "queue", "type": "async", "label": "publish OrderPaid(order_id, auth_code)" },
+    { "from": "api", "to": "db", "type": "sync", "label": "UPDATE orders SET status='paid', paid_at=now()" },
+    { "from": "db", "to": "api", "type": "reply", "label": "COMMIT OK (1 row)" },
+    { "from": "api", "to": "web", "type": "reply", "label": "201 Created {order_id: 10428, status: paid}" },
+    { "from": "web", "to": "user", "type": "reply", "label": "サンクスページ表示（注文番号 10428）" }
+  ],
+  "activations": [
+    { "participant": "db", "fromStep": 3, "toStep": 4 },
+    { "participant": "queue", "fromStep": 8, "toStep": 8 },
+    { "participant": "db", "fromStep": 9, "toStep": 10 }
+  ],
+  "fragments": [
+    {
+      "type": "opt",
+      "label": "在庫・与信プレチェック",
+      "fromStep": 3,
+      "toStep": 4,
+      "fromParticipant": "api",
+      "toParticipant": "db"
+    },
+    {
+      "type": "alt",
+      "label": "決済応答",
+      "fromStep": 5,
+      "toStep": 7,
+      "elseAtStep": 7,
+      "elseLabel": "else [402 決済拒否]",
+      "fromParticipant": "api",
+      "toParticipant": "pay"
+    },
+    {
+      "type": "par",
+      "label": "並列",
+      "fromStep": 8,
+      "toStep": 9,
+      "fromParticipant": "api",
+      "toParticipant": "queue"
+    }
+  ],
+  "notes": [
+    {
+      "atStep": 2,
+      "participant": "web",
+      "spanTo": "api",
+      "text": "PCI DSS 準拠: 送信はトークン化済み payment_token のみ",
+      "height": 40
+    },
+    {
+      "atStep": 5,
+      "participant": "pay",
+      "text": "3D セキュア対応 / タイムアウト 10s / 5xx は指数バックオフで再試行",
+      "width": 176,
+      "height": 44
+    }
+  ]
+}

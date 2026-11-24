@@ -1,0 +1,46 @@
+// Prisma スキャナの基数・複合主キーの回帰を確認する最小スキーマ。
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Member {
+  id       Int      @id @default(autoincrement())
+  email    String   @unique
+  profile  Profile?
+  entries  Blog[]
+  tags     Tag[]    @relation("MemberTags")
+}
+
+model Profile {
+  memberId Int    @id
+  bio      String
+  member   Member @relation(fields: [memberId], references: [id])
+}
+
+// 複合主キーの一部だけを外部キーに使うケース（多数側として描かれるはず）
+model Blog {
+  authorId Int
+  slug     String
+  title    String
+  author   Member @relation(fields: [authorId], references: [id])
+
+  @@id([authorId, slug])
+}
+
+// NULL 許容 + 単独 UNIQUE の外部キー（0..1 : 0..1 になるはず）
+model Membership {
+  id       Int     @id @default(autoincrement())
+  holderId Int?    @unique
+  holder   Member? @relation(fields: [holderId], references: [id])
+}
+
+model Tag {
+  id     Int      @id @default(autoincrement())
+  slug   String   @unique
+  members Member[] @relation("MemberTags")
+}

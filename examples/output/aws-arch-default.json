@@ -1,0 +1,202 @@
+{
+  "title": "AWS アーキテクチャ構成図 (sample-terraform)",
+  "subtitle": "Terraform (.tf) 自動解析 — 実処理・データ層抽出 (SecurityGroup / IAM / ネットワーク補助は省略)",
+  "sourceDir": "examples/aws-arch/sample-terraform",
+  "scannedFiles": 4,
+  "includedOptionalCategories": [],
+  "omittedSummary": {
+    "aws_vpc": 1,
+    "aws_subnet": 1,
+    "aws_security_group": 2,
+    "aws_iam_role": 2,
+    "aws_cloudwatch_log_group": 1
+  },
+  "warnings": [],
+  "nodes": [
+    {
+      "id": "aws_lambda_function_order_api",
+      "tfAddress": "aws_lambda_function.order_api",
+      "module": ".",
+      "tfType": "aws_lambda_function",
+      "tfName": "order_api",
+      "layer": "compute",
+      "kind": "lambda",
+      "label": "order-api-handler",
+      "serviceLabel": "AWS Lambda",
+      "subtitle": "order-api-handler / nodejs22.x",
+      "file": "compute.tf"
+    },
+    {
+      "id": "aws_sfn_state_machine_order_orchestrator",
+      "tfAddress": "aws_sfn_state_machine.order_orchestrator",
+      "module": ".",
+      "tfType": "aws_sfn_state_machine",
+      "tfName": "order_orchestrator",
+      "layer": "compute",
+      "kind": "sfn",
+      "label": "order-workflow-sfn",
+      "serviceLabel": "Step Functions",
+      "subtitle": "order-workflow-sfn / STANDARD",
+      "file": "compute.tf"
+    },
+    {
+      "id": "aws_lambda_function_payment_worker",
+      "tfAddress": "aws_lambda_function.payment_worker",
+      "module": ".",
+      "tfType": "aws_lambda_function",
+      "tfName": "payment_worker",
+      "layer": "compute",
+      "kind": "lambda",
+      "label": "payment-worker",
+      "serviceLabel": "AWS Lambda",
+      "subtitle": "payment-worker / nodejs22.x",
+      "file": "compute.tf"
+    },
+    {
+      "id": "aws_apigatewayv2_api_orders_http_api",
+      "tfAddress": "aws_apigatewayv2_api.orders_http_api",
+      "module": ".",
+      "tfType": "aws_apigatewayv2_api",
+      "tfName": "orders_http_api",
+      "layer": "edge",
+      "kind": "apigw",
+      "label": "orders-http-api",
+      "serviceLabel": "API Gateway (HTTP/WS)",
+      "subtitle": "orders-http-api / HTTP",
+      "file": "edge.tf"
+    },
+    {
+      "id": "aws_cloudwatch_event_rule_daily_reconcile",
+      "tfAddress": "aws_cloudwatch_event_rule.daily_reconcile",
+      "module": ".",
+      "tfType": "aws_cloudwatch_event_rule",
+      "tfName": "daily_reconcile",
+      "layer": "edge",
+      "kind": "eventbridge",
+      "label": "daily-reconcile-rule",
+      "serviceLabel": "EventBridge Rule",
+      "subtitle": "cron(0 2 * * ? *)",
+      "file": "edge.tf"
+    },
+    {
+      "id": "aws_sqs_queue_order_events",
+      "tfAddress": "aws_sqs_queue.order_events",
+      "module": ".",
+      "tfType": "aws_sqs_queue",
+      "tfName": "order_events",
+      "layer": "messaging",
+      "kind": "sqs",
+      "label": "order-events.fifo",
+      "serviceLabel": "Amazon SQS",
+      "subtitle": "order-events.fifo / FIFO",
+      "file": "storage.tf"
+    },
+    {
+      "id": "aws_rds_cluster_aurora_main",
+      "tfAddress": "aws_rds_cluster.aurora_main",
+      "module": ".",
+      "tfType": "aws_rds_cluster",
+      "tfName": "aurora_main",
+      "layer": "storage",
+      "kind": "aurora",
+      "label": "orders-aurora-pg",
+      "serviceLabel": "Amazon Aurora",
+      "subtitle": "aurora-postgresql / orders_db",
+      "file": "storage.tf"
+    },
+    {
+      "id": "aws_dynamodb_table_cart_sessions",
+      "tfAddress": "aws_dynamodb_table.cart_sessions",
+      "module": ".",
+      "tfType": "aws_dynamodb_table",
+      "tfName": "cart_sessions",
+      "layer": "storage",
+      "kind": "dynamodb",
+      "label": "cart-sessions",
+      "serviceLabel": "Amazon DynamoDB",
+      "subtitle": "PK: session_id",
+      "file": "storage.tf"
+    },
+    {
+      "id": "aws_s3_bucket_receipts",
+      "tfAddress": "aws_s3_bucket.receipts",
+      "module": ".",
+      "tfType": "aws_s3_bucket",
+      "tfName": "receipts",
+      "layer": "storage",
+      "kind": "s3",
+      "label": "company-order-receipts",
+      "serviceLabel": "Amazon S3",
+      "subtitle": "company-order-receipts",
+      "file": "storage.tf"
+    }
+  ],
+  "edges": [
+    {
+      "from": "aws_lambda_function_order_api",
+      "to": "aws_rds_cluster_aurora_main",
+      "label": "references",
+      "type": "reference"
+    },
+    {
+      "from": "aws_lambda_function_order_api",
+      "to": "aws_dynamodb_table_cart_sessions",
+      "label": "references",
+      "type": "reference"
+    },
+    {
+      "from": "aws_lambda_function_order_api",
+      "to": "aws_sqs_queue_order_events",
+      "label": "references",
+      "type": "reference"
+    },
+    {
+      "from": "aws_lambda_function_order_api",
+      "to": "aws_sfn_state_machine_order_orchestrator",
+      "label": "references",
+      "type": "reference"
+    },
+    {
+      "from": "aws_sfn_state_machine_order_orchestrator",
+      "to": "aws_lambda_function_payment_worker",
+      "label": "Invoke",
+      "type": "flow"
+    },
+    {
+      "from": "aws_sfn_state_machine_order_orchestrator",
+      "to": "aws_dynamodb_table_cart_sessions",
+      "label": "Task",
+      "type": "flow"
+    },
+    {
+      "from": "aws_lambda_function_payment_worker",
+      "to": "aws_rds_cluster_aurora_main",
+      "label": "references",
+      "type": "reference"
+    },
+    {
+      "from": "aws_lambda_function_payment_worker",
+      "to": "aws_s3_bucket_receipts",
+      "label": "references",
+      "type": "reference"
+    },
+    {
+      "from": "aws_sqs_queue_order_events",
+      "to": "aws_lambda_function_payment_worker",
+      "label": "Trigger / Poll",
+      "type": "async"
+    },
+    {
+      "from": "aws_apigatewayv2_api_orders_http_api",
+      "to": "aws_lambda_function_order_api",
+      "label": "Invoke",
+      "type": "flow"
+    },
+    {
+      "from": "aws_cloudwatch_event_rule_daily_reconcile",
+      "to": "aws_sfn_state_machine_order_orchestrator",
+      "label": "Target",
+      "type": "async"
+    }
+  ]
+}

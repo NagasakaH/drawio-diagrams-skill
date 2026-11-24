@@ -1,0 +1,683 @@
+{
+  "title": null,
+  "subtitle": null,
+  "sources": [
+    "ecommerce.sql"
+  ],
+  "tables": [
+    {
+      "name": "users",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "pk": true,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "email",
+          "type": "varchar(255)",
+          "pk": false,
+          "fk": false,
+          "unique": true,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "display_name",
+          "type": "varchar(100)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "password_hash",
+          "type": "varchar(255)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "phone",
+          "type": "varchar(20)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": false,
+          "comment": ""
+        },
+        {
+          "name": "status",
+          "type": "varchar(20)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        }
+      ],
+      "source": "ecommerce.sql"
+    },
+    {
+      "name": "addresses",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "pk": true,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "user_id",
+          "type": "uuid",
+          "pk": false,
+          "fk": true,
+          "unique": false,
+          "notNull": true,
+          "comment": "",
+          "compositeUnique": true
+        },
+        {
+          "name": "label",
+          "type": "varchar(50)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": "",
+          "compositeUnique": true
+        },
+        {
+          "name": "postal_code",
+          "type": "varchar(8)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "prefecture",
+          "type": "varchar(20)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "city",
+          "type": "varchar(50)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "street",
+          "type": "varchar(255)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "is_default",
+          "type": "boolean",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        }
+      ],
+      "source": "ecommerce.sql"
+    },
+    {
+      "name": "categories",
+      "columns": [
+        {
+          "name": "id",
+          "type": "serial",
+          "pk": true,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "slug",
+          "type": "varchar(64)",
+          "pk": false,
+          "fk": false,
+          "unique": true,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "name",
+          "type": "varchar(100)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "parent_id",
+          "type": "integer",
+          "pk": false,
+          "fk": true,
+          "unique": false,
+          "notNull": false,
+          "comment": ""
+        },
+        {
+          "name": "sort_order",
+          "type": "integer",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        }
+      ],
+      "source": "ecommerce.sql"
+    },
+    {
+      "name": "products",
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigserial",
+          "pk": true,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "sku",
+          "type": "varchar(64)",
+          "pk": false,
+          "fk": false,
+          "unique": true,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "category_id",
+          "type": "integer",
+          "pk": false,
+          "fk": true,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "name",
+          "type": "varchar(200)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "description",
+          "type": "text",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": false,
+          "comment": ""
+        },
+        {
+          "name": "price_cents",
+          "type": "integer",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "stock_quantity",
+          "type": "integer",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "status",
+          "type": "varchar(20)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "released_at",
+          "type": "timestamptz",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": false,
+          "comment": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        }
+      ],
+      "source": "ecommerce.sql"
+    },
+    {
+      "name": "orders",
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigserial",
+          "pk": true,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "user_id",
+          "type": "uuid",
+          "pk": false,
+          "fk": true,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "shipping_address_id",
+          "type": "uuid",
+          "pk": false,
+          "fk": true,
+          "unique": false,
+          "notNull": false,
+          "comment": ""
+        },
+        {
+          "name": "order_no",
+          "type": "varchar(32)",
+          "pk": false,
+          "fk": false,
+          "unique": true,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "status",
+          "type": "varchar(20)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "subtotal_cents",
+          "type": "integer",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "shipping_cents",
+          "type": "integer",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "total_cents",
+          "type": "integer",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "placed_at",
+          "type": "timestamptz",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": false,
+          "comment": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        }
+      ],
+      "source": "ecommerce.sql"
+    },
+    {
+      "name": "order_items",
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigserial",
+          "pk": true,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "order_id",
+          "type": "bigint",
+          "pk": false,
+          "fk": true,
+          "unique": false,
+          "notNull": true,
+          "comment": "",
+          "compositeUnique": true
+        },
+        {
+          "name": "product_id",
+          "type": "bigint",
+          "pk": false,
+          "fk": true,
+          "unique": false,
+          "notNull": true,
+          "comment": "",
+          "compositeUnique": true
+        },
+        {
+          "name": "quantity",
+          "type": "integer",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "unit_price_cents",
+          "type": "integer",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        }
+      ],
+      "source": "ecommerce.sql"
+    },
+    {
+      "name": "payments",
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigserial",
+          "pk": true,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "order_id",
+          "type": "bigint",
+          "pk": false,
+          "fk": true,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "method",
+          "type": "varchar(30)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "provider_charge_id",
+          "type": "varchar(120)",
+          "pk": false,
+          "fk": false,
+          "unique": true,
+          "notNull": false,
+          "comment": ""
+        },
+        {
+          "name": "amount_cents",
+          "type": "integer",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "status",
+          "type": "varchar(20)",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        },
+        {
+          "name": "paid_at",
+          "type": "timestamptz",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": false,
+          "comment": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "pk": false,
+          "fk": false,
+          "unique": false,
+          "notNull": true,
+          "comment": ""
+        }
+      ],
+      "source": "ecommerce.sql"
+    }
+  ],
+  "relations": [
+    {
+      "id": "rel_1",
+      "from": "users",
+      "to": "addresses",
+      "fromColumns": [
+        "id"
+      ],
+      "toColumns": [
+        "user_id"
+      ],
+      "label": "user_id",
+      "cardinality": "1:0..N"
+    },
+    {
+      "id": "rel_2",
+      "from": "categories",
+      "to": "categories",
+      "fromColumns": [
+        "id"
+      ],
+      "toColumns": [
+        "parent_id"
+      ],
+      "label": "parent_id",
+      "cardinality": "0..1:0..N"
+    },
+    {
+      "id": "rel_3",
+      "from": "categories",
+      "to": "products",
+      "fromColumns": [
+        "id"
+      ],
+      "toColumns": [
+        "category_id"
+      ],
+      "label": "category_id",
+      "cardinality": "1:0..N"
+    },
+    {
+      "id": "rel_4",
+      "from": "addresses",
+      "to": "orders",
+      "fromColumns": [
+        "id"
+      ],
+      "toColumns": [
+        "shipping_address_id"
+      ],
+      "label": "shipping_address_id",
+      "cardinality": "0..1:0..N"
+    },
+    {
+      "id": "rel_5",
+      "from": "users",
+      "to": "orders",
+      "fromColumns": [
+        "id"
+      ],
+      "toColumns": [
+        "user_id"
+      ],
+      "label": "user_id",
+      "cardinality": "1:0..N"
+    },
+    {
+      "id": "rel_6",
+      "from": "orders",
+      "to": "order_items",
+      "fromColumns": [
+        "id"
+      ],
+      "toColumns": [
+        "order_id"
+      ],
+      "label": "order_id",
+      "cardinality": "1:0..N"
+    },
+    {
+      "id": "rel_7",
+      "from": "products",
+      "to": "order_items",
+      "fromColumns": [
+        "id"
+      ],
+      "toColumns": [
+        "product_id"
+      ],
+      "label": "product_id",
+      "cardinality": "1:0..N"
+    },
+    {
+      "id": "rel_8",
+      "from": "orders",
+      "to": "payments",
+      "fromColumns": [
+        "id"
+      ],
+      "toColumns": [
+        "order_id"
+      ],
+      "label": "order_id",
+      "cardinality": "1:0..N"
+    }
+  ]
+}

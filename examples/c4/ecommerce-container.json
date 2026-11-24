@@ -1,0 +1,202 @@
+{
+  "title": "E コマースプラットフォーム（C4 Container レベル）",
+  "subtitle": "境界内は自社で運用するコンテナ、境界外は第三者サービス — 実線は同期呼び出し、破線は非同期イベント",
+  "boundaries": [
+    {
+      "id": "shop",
+      "label": "E-commerce Platform",
+      "kind": "Software System"
+    }
+  ],
+  "elements": [
+    {
+      "id": "customer",
+      "kind": "person",
+      "name": "Customer",
+      "description": "商品購入・注文・返品を行うエンドユーザー",
+      "row": 1,
+      "col": 0
+    },
+    {
+      "id": "admin",
+      "kind": "person",
+      "name": "Ops Staff",
+      "description": "注文管理と返金対応を行う運営スタッフ",
+      "row": 3,
+      "col": 0,
+      "tech": "社内管理コンソール"
+    },
+    {
+      "id": "web",
+      "kind": "container",
+      "name": "Web Storefront",
+      "tech": "Next.js 14 / TypeScript",
+      "description": "商品閲覧・カート・決済画面を提供する SPA",
+      "boundary": "shop",
+      "row": 0,
+      "col": 1
+    },
+    {
+      "id": "mobile",
+      "kind": "container",
+      "name": "Mobile App",
+      "tech": "React Native",
+      "description": "iOS / Android 向け購買アプリ",
+      "boundary": "shop",
+      "row": 2,
+      "col": 1
+    },
+    {
+      "id": "gateway",
+      "kind": "container",
+      "name": "API Gateway (BFF)",
+      "tech": "Node.js / Fastify",
+      "description": "認証・レート制御・下位サービスへのルーティング",
+      "boundary": "shop",
+      "row": 1,
+      "col": 2
+    },
+    {
+      "id": "order",
+      "kind": "container",
+      "name": "Order Service",
+      "tech": "Go 1.23 / gRPC",
+      "description": "注文ライフサイクルと在庫引き当てを管理",
+      "boundary": "shop",
+      "row": 1,
+      "col": 3
+    },
+    {
+      "id": "worker",
+      "kind": "container",
+      "name": "Notification Worker",
+      "tech": "Python 3.12",
+      "description": "イベントを消費してメール / Push を送信",
+      "boundary": "shop",
+      "row": 3,
+      "col": 3
+    },
+    {
+      "id": "pg",
+      "kind": "database",
+      "name": "Orders DB",
+      "tech": "PostgreSQL 16",
+      "description": "注文・決済履歴の正 (source of truth)",
+      "boundary": "shop",
+      "row": 0,
+      "col": 4
+    },
+    {
+      "id": "redis",
+      "kind": "database",
+      "name": "Session Cache",
+      "tech": "Redis 7",
+      "description": "カートとセッションの短期保持",
+      "boundary": "shop",
+      "row": 2,
+      "col": 4
+    },
+    {
+      "id": "bus",
+      "kind": "queue",
+      "name": "Order Events",
+      "tech": "Amazon SQS / SNS",
+      "description": "注文ドメインイベントの配信",
+      "boundary": "shop",
+      "row": 2,
+      "col": 2
+    },
+    {
+      "id": "stripe",
+      "kind": "external",
+      "name": "Stripe",
+      "tech": "Payments API",
+      "description": "カード決済と返金の外部プロバイダー",
+      "row": 0,
+      "col": 5
+    },
+    {
+      "id": "sendgrid",
+      "kind": "external",
+      "name": "SendGrid",
+      "tech": "Email API",
+      "description": "トランザクションメールの配信基盤",
+      "row": 4,
+      "col": 4
+    }
+  ],
+  "relationships": [
+    {
+      "from": "customer",
+      "to": "web",
+      "label": "browses / HTTPS",
+      "kind": "sync"
+    },
+    {
+      "from": "customer",
+      "to": "mobile",
+      "label": "browses / HTTPS",
+      "kind": "sync"
+    },
+    {
+      "from": "admin",
+      "to": "gateway",
+      "label": "admin ops / HTTPS + JSON",
+      "kind": "sync"
+    },
+    {
+      "from": "web",
+      "to": "gateway",
+      "label": "REST / JSON",
+      "kind": "sync"
+    },
+    {
+      "from": "mobile",
+      "to": "gateway",
+      "label": "REST / JSON",
+      "kind": "sync"
+    },
+    {
+      "from": "gateway",
+      "to": "order",
+      "label": "gRPC / protobuf",
+      "kind": "sync"
+    },
+    {
+      "from": "order",
+      "to": "pg",
+      "label": "SQL / TLS",
+      "kind": "sync"
+    },
+    {
+      "from": "gateway",
+      "to": "redis",
+      "label": "RESP / session",
+      "kind": "sync"
+    },
+    {
+      "from": "order",
+      "to": "bus",
+      "label": "Async Event: order.placed",
+      "kind": "async"
+    },
+    {
+      "from": "bus",
+      "to": "worker",
+      "label": "Async Event: consume",
+      "kind": "async"
+    },
+    {
+      "from": "order",
+      "to": "stripe",
+      "label": "Payment / HTTPS",
+      "kind": "external"
+    },
+    {
+      "from": "worker",
+      "to": "sendgrid",
+      "label": "Email / HTTPS",
+      "kind": "external"
+    }
+  ]
+}
