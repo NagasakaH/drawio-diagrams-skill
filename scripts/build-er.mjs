@@ -17,13 +17,14 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
 import { convertXmlToPng, convertXmlToSvg } from "./drawio2png.mjs";
-import { scanSchemaFiles } from "./scan-schema.mjs";
+import { scanSchemaFiles, collectSchemaInputFiles } from "./scan-schema.mjs";
 import {
   assertOutputsDistinctFromInputs,
   createCellIdMap,
   emitDiagramFiles,
-  expandInputPaths,
   isDirectRun,
+  resolveWriteTarget,
+  writeFileAtomic,
 } from "./diagram-shared.mjs";
 
 // ---------------------------------------------------------------------------
@@ -849,24 +850,38 @@ async function main() {
   // --- 入力・出力の衝突検査（必ず「最初の書き込み」より前に行う） -----------
   // --json-out はスキャン直後に書き込まれるため、検査が後になると入力 SQL そのものへ
   // JSON を書き込んで原文を失う。ここでは 1 バイトも書き込まずに exit 1 する。
+  // 照合には scan-schema と同じ走査関数（collectSchemaInputFiles）の一覧を使い、
+  // `out/` などビルダー側の簡易走査が拾わないディレクトリも必ず対象に含める。
   const outPath = values.output || "er.drawio.png";
   const xmlOutPath =
     values["xml-out"] || outPath.replace(/\.drawio\.png$|\.png$|\.svg$/i, "") + ".drawio";
-  const schemaFiles = values.spec
-    ? []
-    : (await expandInputPaths(schemaInputs, /\.(sql|prisma)$/i)).files;
-
-  assertOutputsDistinctFromInputs({
-    inputs: values.spec
+  const outputEntries = [
+    { role: "--json-out", value: values["json-out"] },
+    { role: "--xml-out", value: xmlOutPath },
+    { role: "--output", value: outPath },
+  ];
+  const clashInputs = (scannedFiles) =>
+    values.spec
       ? [{ role: "--spec", value: values.spec }]
-      : schemaInputs.map((p) => ({ role: "--schema", value: p, files: schemaFiles })),
-    outputs: [
-      { role: "--json-out", value: values["json-out"] },
-      { role: "--xml-out", value: xmlOutPath },
-      { role: "--output", value: outPath },
-    ],
-  });
+      : [
+          ...schemaInputs.map((p) => ({ role: "--schema", value: p })),
+          { role: "--schema（スキャン対象）", files: scannedFiles },
+        ];
 
+  let plannedSchemaFiles = [];
+  if (!values.spec) {
+    plannedSchemaFiles = await collectSchemaInputFiles(schemaInputs, {
+      followSymlinks: values["follow-symlinks"],
+    });
+    assertOutputsDistinctFromInputs({
+      inputs: clashInputs(plannedSchemaFiles),
+      outputs: outputEntries,
+    });
+  } else {
+    assertOutputsDistinctFromInputs({ inputs: clashInputs([]), outputs: outputEntries });
+  }
+
+  const scannedSchemaFiles = [];
   let spec;
   if (values.spec) {
     spec = JSON.parse(await fs.readFile(values.spec, "utf8"));
@@ -877,10 +892,17 @@ async function main() {
       title: values.title,
       subtitle: values.subtitle,
       followSymlinks: values["follow-symlinks"],
+      files: plannedSchemaFiles,
+      scannedInputFiles: scannedSchemaFiles,
+    });
+    // 書き込み直前に、実際に走査した一覧でもう一度検査する
+    assertOutputsDistinctFromInputs({
+      inputs: clashInputs(scannedSchemaFiles),
+      outputs: outputEntries,
     });
     if (values["json-out"]) {
-      await fs.mkdir(path.dirname(path.resolve(values["json-out"])), { recursive: true });
-      await fs.writeFile(values["json-out"], JSON.stringify(spec, null, 2), "utf8");
+      await fs.mkdir(path.dirname(resolveWriteTarget(values["json-out"])), { recursive: true });
+      await writeFileAtomic(values["json-out"], JSON.stringify(spec, null, 2));
       console.log(`Generated JSON: ${values["json-out"]}`);
     }
   }
@@ -889,6 +911,14 @@ async function main() {
 
   const scale = parseFloat(values.scale) || 2;
   const border = parseInt(values.border, 10) || 16;
+
+  if (!values.spec) {
+    // .drawio / 画像を書く直前にも同じ実走査一覧で再検査する
+    assertOutputsDistinctFromInputs({
+      inputs: clashInputs(scannedSchemaFiles),
+      outputs: outputEntries,
+    });
+  }
 
   // 先にメモリ上で変換し、成功してから .drawio / 画像を書き出す
   // （変換失敗時に「新しい XML + 古い画像」の不整合を残さない）

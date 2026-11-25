@@ -25,10 +25,11 @@ import {
   assertOutputsDistinctFromInputs,
   createCellIdMap,
   emitDiagramFiles,
-  expandInputPaths,
   isDirectRun,
+  resolveWriteTarget,
+  writeFileAtomic,
 } from "./diagram-shared.mjs";
-import { scanDirectory } from "./scan-classes.mjs";
+import { scanDirectory, collectScannedSourceFiles, safeDisplayDir } from "./scan-classes.mjs";
 
 // ---------------------------------------------------------------------------
 // テーマパレット
@@ -747,7 +748,7 @@ export function buildDiagramXml(spec, opts = {}) {
 // CLI
 // ---------------------------------------------------------------------------
 
-async function loadSpec(values) {
+async function loadSpec(values, scannedInputFiles) {
   if (values.spec) {
     const raw = await fsp.readFile(values.spec, "utf8");
     try {
@@ -758,7 +759,8 @@ async function loadSpec(values) {
   }
   if (values["src-dir"]) {
     return scanDirectory(values["src-dir"], {
-      title: values.title || `Class diagram (${values["src-dir"]})`,
+      title: values.title || `Class diagram (${safeDisplayDir(values["src-dir"])})`,
+      scannedInputFiles,
     });
   }
   throw new Error("--spec または --src-dir のいずれかを指定してください");
@@ -794,26 +796,39 @@ export async function run(argv = process.argv.slice(2)) {
   const xmlOut =
     values["xml-out"] ||
     output.replace(/(\.drawio)?\.(png|svg)$/i, "") + ".drawio";
-  const sourceFiles = values.spec
-    ? []
-    : (
-        await expandInputPaths(
-          values["src-dir"] ? [values["src-dir"]] : [],
-          /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/i
-        )
-      ).files;
-
-  assertOutputsDistinctFromInputs({
-    inputs: values.spec
+  const outputEntries = [
+    { role: "--xml-out", value: xmlOut },
+    { role: "--output", value: output },
+  ];
+  // 照合には scan-classes と同じ走査関数（collectScannedSourceFiles）の一覧を使う
+  const clashInputs = (sourceFiles) =>
+    values.spec
       ? [{ role: "--spec", value: values.spec }]
-      : [{ role: "--src-dir", value: values["src-dir"], files: sourceFiles }],
-    outputs: [
-      { role: "--xml-out", value: xmlOut },
-      { role: "--output", value: output },
-    ],
-  });
+      : [
+          { role: "--src-dir", value: values["src-dir"] },
+          { role: "--src-dir（スキャン対象）", files: sourceFiles },
+        ];
 
-  const spec = await loadSpec(values);
+  let plannedSourceFiles = [];
+  if (values.spec) {
+    assertOutputsDistinctFromInputs({ inputs: clashInputs([]), outputs: outputEntries });
+  } else {
+    plannedSourceFiles = await collectScannedSourceFiles(values["src-dir"]);
+    assertOutputsDistinctFromInputs({
+      inputs: clashInputs(plannedSourceFiles),
+      outputs: outputEntries,
+    });
+  }
+
+  const scannedSourceFiles = [];
+  const spec = await loadSpec(values, scannedSourceFiles);
+  if (!values.spec) {
+    // 書き込み直前に、実際に走査した一覧でもう一度検査する
+    assertOutputsDistinctFromInputs({
+      inputs: clashInputs(scannedSourceFiles),
+      outputs: outputEntries,
+    });
+  }
   const xml = buildDiagramXml(spec, {
     title: values.title,
     subtitle: values.subtitle,
@@ -821,8 +836,8 @@ export async function run(argv = process.argv.slice(2)) {
   });
 
   if (values["no-png"]) {
-    await fsp.mkdir(path.dirname(path.resolve(xmlOut)), { recursive: true });
-    await fsp.writeFile(xmlOut, xml, "utf8");
+    await fsp.mkdir(path.dirname(resolveWriteTarget(xmlOut)), { recursive: true });
+    await writeFileAtomic(xmlOut, xml);
     console.log(`${output} の元 XML -> ${xmlOut}`);
     return;
   }

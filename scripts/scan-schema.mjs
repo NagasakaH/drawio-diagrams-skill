@@ -20,7 +20,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
-import { isDirectRun } from "./diagram-shared.mjs";
+import {
+  assertOutputsDistinctFromInputs,
+  isDirectRun,
+  resolveWriteTarget,
+  writeFileAtomic,
+} from "./diagram-shared.mjs";
 
 // ---------------------------------------------------------------------------
 // shared helpers
@@ -658,14 +663,17 @@ function parsePrisma(text, sourceName) {
 // ---------------------------------------------------------------------------
 
 /**
- * 入力ファイル収集。
+ * 入力ファイル収集（スキャナが実際に読み取るファイル一覧の単一の出どころ）。
  *
  * - 明示的に渡されたパス（root）は symlink でも追跡する（利用者の意図）
  * - ディレクトリ内のchild が symlink の場合は**既定でスキップ**する。
  *   外部ディレクトリへの越境や循環 symlink でのクラッシュを防ぐため。
  *   追跡したいときは `--follow-symlinks` を使う（その場合も訪問済み実体パスで循環を守る）。
+ *
+ * 出力先の上書き防止検査（assertOutputsDistinctFromInputs）に渡す一覧も
+ * この関数が返す一覧を使う — 別.walker で「入力に無い」と判定する事故を防ぐ。
  */
-async function collectInputFiles(inputs, options = {}) {
+export async function collectSchemaInputFiles(inputs, options = {}) {
   const followSymlinks = Boolean(options.followSymlinks);
   const files = [];
   const visitedDirs = new Set();
@@ -723,9 +731,16 @@ async function collectInputFiles(inputs, options = {}) {
 
 /**
  * Scan .sql / .prisma files (or directories containing them) into an ER spec.
+ *
+ * `options.files` を渡すとその一覧をそのまま走査する（呼び出し側の
+ * 上書き防止検査と、同じ一覧を共有するための口）。
+ * `options.scannedInputFiles`（配列）を渡すと、実際に走査したファイルパスを詰め戻す。
  */
 export async function scanSchemaFiles(inputs, options = {}) {
-  const files = await collectInputFiles(inputs, options);
+  const files = options.files
+    ? options.files.map((f) => path.resolve(f))
+    : await collectSchemaInputFiles(inputs, options);
+  if (Array.isArray(options.scannedInputFiles)) options.scannedInputFiles.push(...files);
   if (files.length === 0) {
     throw new Error(`No .sql / .prisma files found in: ${inputs.join(", ")}`);
   }
@@ -836,16 +851,36 @@ async function main() {
     process.exit(values.help ? 0 : 1);
   }
 
+  // 書き込み前の必須検査: `-o` にスキャン対象を指定されたら、1 バイトも書く前に止まる
+  const outputs = [{ role: "-o / --output", value: values.output }];
+  const inputEntries = positionals.map((p, i) => ({ role: `入力 ${i + 1}`, value: p }));
+  const scannedInputFiles = [];
+  const plannedFiles = await collectSchemaInputFiles(positionals, {
+    followSymlinks: values["follow-symlinks"],
+  });
+  assertOutputsDistinctFromInputs({
+    inputs: [...inputEntries, { role: "スキャン対象", files: plannedFiles }],
+    outputs,
+  });
+
   const spec = await scanSchemaFiles(positionals, {
     title: values.title,
     subtitle: values.subtitle,
     followSymlinks: values["follow-symlinks"],
+    files: plannedFiles,
+    scannedInputFiles,
+  });
+
+  // 実際に走査した一覧で、書き込み直前にもう一度確かめる
+  assertOutputsDistinctFromInputs({
+    inputs: [...inputEntries, { role: "スキャン対象", files: scannedInputFiles }],
+    outputs,
   });
 
   const json = JSON.stringify(spec, null, 2);
   if (values.output) {
-    await fs.mkdir(path.dirname(path.resolve(values.output)), { recursive: true });
-    await fs.writeFile(values.output, json, "utf8");
+    await fs.mkdir(path.dirname(resolveWriteTarget(values.output)), { recursive: true });
+    await writeFileAtomic(values.output, json);
     console.log(
       `Scanned ${spec.tables.length} tables / ${spec.relations.length} relations -> ${values.output}`
     );

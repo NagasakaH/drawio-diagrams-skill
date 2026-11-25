@@ -20,10 +20,19 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { assertDistinctPaths, inspectXmlCells } from "../scripts/diagram-shared.mjs";
+import {
+  assertDistinctPaths,
+  emitDiagramFiles,
+  ensureLockDir,
+  getTargetLockPaths,
+  inspectXmlCells,
+  resolveWriteTarget,
+  splitPathRoot,
+  writeFileAtomic,
+} from "../scripts/diagram-shared.mjs";
 import { extractDrawioXmlFromPng, getDrawioOssRuntime } from "../scripts/drawio2png.mjs";
 import { generateC4DiagramXml } from "../scripts/build-c4.mjs";
 import { buildDiagramXml as buildClassXml } from "../scripts/build-class.mjs";
@@ -37,6 +46,7 @@ import {
 import { generateErDrawioXml } from "../scripts/build-er.mjs";
 import { generateAwsArchDrawioXml } from "../scripts/build-aws-arch.mjs";
 import { scanSchemaFiles } from "../scripts/scan-schema.mjs";
+import { scanDirectory } from "../scripts/scan-classes.mjs";
 import { scanTerraformDirectory } from "../scripts/scan-terraform.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -641,7 +651,7 @@ test("シーケンス図: メッセージ 0 件でも断片・ノート・アク
 // 5. スキャナ: シンボリックリンク / スキーマ修飾 / Prisma 複数ファイル
 // ---------------------------------------------------------------------------
 
-test("scan-schema: 既定で symlink を辿らず、循環・切断リンクでも落ちない", async () => {
+test("scan-schema: 既定で symlink を辿らず、循環・切断リンクでも落ちない", async (t) => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-scan-"));
   try {
     const inside = path.join(tmp, "schema");
@@ -651,10 +661,16 @@ test("scan-schema: 既定で symlink を辿らず、循環・切断リンクで�
     await fs.writeFile(path.join(inside, "a.sql"), "CREATE TABLE a (id INTEGER PRIMARY KEY);\n");
     await fs.writeFile(path.join(outside, "b.sql"), "CREATE TABLE b (id INTEGER PRIMARY KEY);\n");
     // ルート内の別ディレクトリへ出るリンク / ルート外へ出るリンク / 切断リンク / 循環リンク
-    await fs.symlink(path.join(tmp, "outside"), path.join(inside, "escape"));
-    await fs.symlink(path.join(inside, "a.sql"), path.join(inside, "link.sql"));
-    await fs.symlink(path.join(inside, "nowhere.sql"), path.join(inside, "broken.sql"));
-    await fs.symlink(inside, path.join(inside, "self"));
+    const linkResults = await Promise.all([
+      trySymlink(path.join(tmp, "outside"), path.join(inside, "escape")),
+      trySymlink(path.join(inside, "a.sql"), path.join(inside, "link.sql")),
+      trySymlink(path.join(inside, "nowhere.sql"), path.join(inside, "broken.sql")),
+      trySymlink(inside, path.join(inside, "self")),
+    ]);
+    if (linkResults.some((ok) => !ok)) {
+      t.skip("symlink を作成できない環境のためスキップ");
+      return;
+    }
 
     const spec = await scanSchemaFiles([inside]);
     assert.deepEqual(
@@ -713,7 +729,6 @@ test("scan-schema(Prisma): 複数ファイルにまたがる relation を失わ�
     await fs.rm(tmp, { recursive: true, force: true });
   }
 });
-
 // ---------------------------------------------------------------------------
 // 6. drawio2png.mjs: 単一ファイル完結と、インストール先依存のなさ
 // ---------------------------------------------------------------------------
@@ -1149,63 +1164,2780 @@ test("ワークフロー: レーン ID `team` とノード ID `lane_team` が衝
   }
 });
 
-test("drawio2png.mjs / NOTICE / README: MPL-2.0 対象領域の境界と Source Code Form の所在が実装と一致する", () => {
+test("drawio2png.mjs / NOTICE / README: ファイル全体の MPL-2.0 と Source Code Form の所在が 3 文書で一致する", () => {
   const src = readText(path.join(ROOT, "scripts", "drawio2png.mjs"));
   const notice = readText(path.join(ROOT, "NOTICE"));
   const readme = readText(path.join(ROOT, "README.md"));
-  const BEGIN = "// BEGIN MPL-2.0 COVERED SOFTWARE (@resvg/resvg-wasm v2.6.2)";
-  const END = "// END MPL-2.0 COVERED SOFTWARE (@resvg/resvg-wasm v2.6.2)";
+  const BEGIN = "// BEGIN MPL-2.0 UPSTREAM CODE (@resvg/resvg-wasm v2.6.2)";
+  const END = "// END MPL-2.0 UPSTREAM CODE (@resvg/resvg-wasm v2.6.2)";
 
-  // ライセンスヘッダより後ろ（実コード）で BEGIN / END が対になっている
-  const code = src.slice(src.indexOf("\n */\n") + 5);
-  const regions = code.split(BEGIN).slice(1).map((chunk) => chunk.split(END)[0]);
-  assert.equal(regions.length, code.split(END).length - 1, "MPL-2.0 の BEGIN / END マーカーが対になっていません");
-  assert.ok(regions.length >= 2, "MPL-2.0 の対象領域がマーカーで囲まれていません");
-
-  // 囲まれているのは「wasm の base64」と「wasm-bindgen グルー」だけ
-  assert.ok(
-    regions.some((r) => r.includes("const EMBEDDED_RESVG_WASM_B64")),
-    "EMBEDDED_RESVG_WASM_B64 が MPL-2.0 の対象領域として囲まれていません"
+  // 1) ヘッダが「ファイル全体 = MPL-2.0」をうたっている（部分適用の言い訳を残さない）
+  const header = src.slice(0, src.indexOf("\n */\n") + 5);
+  assert.ok(header.length > 200, "ライセンスヘッダが見つかりません");
+  // ヘッダは行頭 " * " で折り返されているので、1 行につないだ本文として検査する
+  const headerText = header.replace(/\r/g, "").replace(/\n \* /g, " ");
+  assert.match(headerText, /THIS ENTIRE FILE IS DISTRIBUTED UNDER THE MPL-2\.0/);
+  assert.match(headerText, /MPL-2\.0 works file by/);
+  assert.match(headerText, /section 1\.4/);
+  assert.match(headerText, /section 1\.10\(b\)/);
+  assert.match(headerText, /section 1\.13/);
+  assert.match(headerText, /section 3\.1/);
+  assert.match(headerText, /section 3\.2/);
+  assert.ok(!/1\.12/.test(headerText), "drawio2png.mjs ヘッダに古い §1.12 誤記が残っています");
+  assert.match(
+    header,
+    /Comment markers inside[\s\S]{0,140}cannot carve out a narrower Covered Work/,
+    "コメントマーカーで対象領域を絞る旧発想に戻っています"
   );
+
+  // 2) Source Code Form = JS 本体・修正済みグルーはこのファイル自体、未改変 WASM (Executable Form) の Rust/WASM ソースは上流 URL
+  assert.match(headerText, /WHERE THE SOURCE CODE FORM IS/);
+  assert.match(headerText, /Source Code Form of the converter and the[\s\S]{0,40}modified glue/);
+  assert.match(headerText, /unobfuscated,[\s\S]{0,20}uncompressed JavaScript/);
+  assert.match(headerText, /Executable Form[\s\S]{0,80}MPL-2\.0 section 3\.2/);
+  assert.match(headerText, /https:\/\/www\.mozilla\.org\/en-US\/MPL\/2\.0\//);
+
+  // 3) 内包する第三者資産の帰属（draw.io Apache-2.0 / resvg MPL-2.0 / Atlassian / 商標）
+  assert.match(headerText, /https:\/\/github\.com\/jgraph\/drawio\/tree\/v29\.6\.6/);
+  assert.match(headerText, /https:\/\/github\.com\/thx\/resvg-js\/tree\/v2\.6\.2/);
+  assert.match(headerText, /Apache License, Version 2\.0/);
+  assert.match(headerText, /Atlassian products/);
+  assert.match(headerText, /registered EU trademark \(#018062448\)/);
+
+  // 4) Larger Work（§1.7 / §3.3）と、残りのファイルが Apache-2.0 であることの明記
+  assert.match(headerText, /sections 1\.7 \/ 3\.3/);
+  assert.match(headerText, /Larger Work/);
+  assert.match(headerText, /licensed under the Apache License, Version/);
+  for (const f of [
+    "scripts/build-*.mjs",
+    "scripts/scan-*.mjs",
+    "scripts/drawio-cli.mjs",
+    "scripts/diagram-shared.mjs",
+    "scripts/check-layout.mjs",
+    "SKILL.md",
+    "references/",
+    "examples/",
+    "tests/",
+  ]) {
+    assert.ok(header.includes(f), `Larger Work を構成するファイル列挙に ${f} がありません`);
+  }
+
+  // 5) 来歴マーカーは 2 組対で、どちらも「ライセンスの境界ではない」と明記している
+  const code = src.slice(header.length);
+  const regions = code.split(BEGIN).slice(1).map((chunk) => chunk.split(END)[0]);
+  assert.equal(regions.length, code.split(END).length - 1, "来歴マーカーの BEGIN / END が対になっていません");
+  assert.equal(regions.length, 2, "来歴マーカーは wasm の base64 と JS グルーの 2 組のはずです");
+  assert.ok(regions[0].includes("EMBEDDED_RESVG_WASM_B64"), "wasm の base64 が来歴マーカーで囲まれていません");
   assert.ok(
-    regions.some((r) => r.includes("__wbg_finalize_init") && r.includes("isCustomFontsOptions")),
-    "wasm-bindgen の同期初期化グルーが MPL-2.0 の対象領域として囲まれていません"
+    regions[1].includes("__wbg_finalize_init") && regions[1].includes("isCustomFontsOptions"),
+    "同期初期化へ対応済みの JS グルーが来歴マーカーで囲まれていません"
   );
   assert.ok(
     !regions.some((r) => r.includes("EMBEDDED_SHAPES_B64") || r.includes("EMBEDDED_STENCILS_MAP")),
-    "Apache-2.0 側の draw.io アセットが MPL-2.0 の対象領域に巻き込まれています"
+    "draw.io 資産の塊が resvg の来歴マーカーに巻き込まれています"
   );
-  const afterMarkers = code.slice(code.lastIndexOf(END));
-  assert.ok(
-    afterMarkers.includes("__getResvgRenderer"),
-    "自前のコンバーターコードが MPL-2.0 の対象領域の内側に残っています"
-  );
+  for (const chunk of code.split(BEGIN).slice(1)) {
+    assert.match(chunk.slice(0, 500), /NOT a license boundary/, "来歴マーカーの「境界ではない」注記がありません");
+  }
+  // マーカーの外側（このファイルの残り全部）も MPL-2.0 なので、変換コードが外にあっても矛盾しない
+  assert.ok(code.slice(code.lastIndexOf(END)).includes("__getResvgRenderer"));
 
-  // Source Code Form の所在（このファイル自体が修正版のソース）と来歴 URL
-  assert.match(src, /Larger Work[\s\S]{0,200}section 3\.3|section 3\.3[\s\S]{0,200}Larger Work/);
-  assert.match(src, /WHERE THE SOURCE CODE FORM OF THE MODIFIED GLUE IS AVAILABLE/);
-  assert.match(src, /readable, unobfuscated, uncompressed JavaScript/);
-  assert.match(src, /https:\/\/github\.com\/thx\/resvg-js\/tree\/v2\.6\.2/);
-  assert.match(
-    src,
-    /https:\/\/github\.com\/jgraph\/drawio\/tree\/v29\.6\.6/,
-    "Apache-2.0 部（draw.io アセット）の上流 URL がヘッダにありません"
-  );
-  assert.match(src, /https:\/\/www\.mozilla\.org\/en-US\/MPL\/2\.0\//);
+  // 6) 部分適用時代の記述（「その領域だけ MPL-2.0」）が 3 文書のどこにも残っていない
+  for (const [name, text] of [
+    ["scripts/drawio2png.mjs", src],
+    ["NOTICE", notice],
+    ["README.md", readme],
+  ]) {
+    assert.ok(!/MPL-2\.0 COVERED SOFTWARE/.test(text), `${name} に旧マーカー名が残っています`);
+    assert.ok(
+      !/この領域だけ MPL-2\.0|この部分だけ MPL-2\.0/.test(text),
+      `${name} に部分適用の記述が残っています`
+    );
+  }
 
-  // NOTICE / README も同じ内容に揃えている（上流だけに依存した記述に戻していない）
-  assert.ok(notice.includes("BEGIN MPL-2.0 COVERED SOFTWARE"), "NOTICE に境界マーカーの記述がありません");
-  assert.match(notice, /modified Source Code Form is distributed with this product/i);
-  assert.match(notice, /Larger Work \/ Combined\s*\n?\s*distribution/i, "NOTICE に MPL-2.0 §3.3 の位置づけがありません");
+  // 7) NOTICE も「ファイル全体」の立場で §1.4 / §1.7 / §1.10(b) / §1.13 / §3.1 / §3.2 / §3.3 を挙げている
+  assert.match(notice, /AS A WHOLE FILE, under the Mozilla Public License/);
+  assert.match(notice, /section 1\.4/);
+  assert.match(notice, /section 1\.10\(b\)/);
+  assert.match(notice, /section 1\.13/);
+  assert.match(notice, /section 3\.1/);
+  assert.match(notice, /section 3\.2/);
+  assert.match(notice, /section 3\.3/);
+  assert.match(notice, /sections 1\.7 and 3\.3/);
+  assert.ok(!/\b1\.12\b/.test(notice), "NOTICE に古い §1.12 誤記が残っています");
+  assert.match(notice, /provenance notes only/);
+  assert.match(notice, /WHERE THE SOURCE CODE FORM IS/);
+  assert.match(notice, /is itself the Source Code Form/);
+  assert.match(notice, /Executable Form[\s\S]{0,200}MPL-2\.0 section 3\.2/);
+  assert.match(notice, /Larger Work/);
+  assert.match(notice, /https:\/\/github\.com\/thx\/resvg-js\/tree\/v2\.6\.2/);
+  assert.match(notice, /https:\/\/github\.com\/jgraph\/drawio\/tree\/v29\.6\.6/);
+  assert.match(notice, /https:\/\/www\.mozilla\.org\/en-US\/MPL\/2\.0\//);
+  assert.match(notice, /Atlassian products/);
+  assert.match(notice, /registered EU trademark \(#018062448\)/);
   assert.ok(
     !/corresponding Source Code Form remains available upstream/.test(notice),
     "NOTICE が修正版の Source Code Form を上流依存だけと書いています"
   );
-  assert.match(readme, /BEGIN MPL-2\.0 COVERED SOFTWARE/);
-  assert.match(readme, /そのものが修正版の\s*Source Code Form/);
-  assert.match(readme, /Larger Work/);
+
+  // 8) README の表と説明も「ファイル全体 = MPL-2.0」「§1.4 / §1.7 / §1.13 / §3.2」「来歴メモ」に揃えている
+  assert.match(readme, /\*\*MPL-2\.0\*\*（ファイル全体）/);
+  assert.match(readme, /MPL-2\.0 はファイル単位で適用される/);
+  assert.match(readme, /§1\.7 \/ §3\.3 がいう \*\*Larger Work\*\*/);
+  assert.match(readme, /§1\.4・§1\.10\(b\)・§3\.1・§3\.2・§3\.3/);
+  assert.match(readme, /§1\.13/);
+  assert.ok(!/§1\.12/.test(readme), "README に古い §1.12 誤記が残っています");
+  assert.match(readme, /MPL-2\.0 UPSTREAM CODE/);
+  assert.match(readme, /\*\*来歴メモ\*\*/);
+  assert.match(readme, /ライセンスの境界ではありません/);
+  assert.match(readme, /そのものが Source Code Form です/);
+  assert.match(readme, /Executable Form[\s\S]{0,160}MPL-2\.0 §3\.2/);
   assert.ok(
     !/Source Code Form は\s*上の来歴 URL に公開/.test(readme),
     "README が修正版の Source Code Form を上流 URL のみに公開している記述に戻っています"
   );
+});
+
+// ---------------------------------------------------------------------------
+// 10. Codex Turn 4 レビューの High / Medium 指摘への回帰テスト
+// ---------------------------------------------------------------------------
+
+/** そのファイルシステムが大文字小文字を区別しないかを実測する（macOS / Windows 前提の検査を絞る） */
+function probeCaseInsensitiveFs(dir) {
+  const probe = path.join(dir, "CaseProbe.TXT");
+  fsSync.writeFileSync(probe, "x");
+  try {
+    return fsSync.existsSync(path.join(dir, "caseprobe.txt"));
+  } finally {
+    fsSync.rmSync(probe, { force: true });
+  }
+}
+
+/** symlink を作れる環境か（作れなければ false を返し、その検査だけ飛ばす） */
+async function trySymlink(target, linkPath) {
+  try {
+    await fs.symlink(target, linkPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const MINIMAL_DRAWIO = `<mxfile host="app" version="test">
+  <diagram id="p1" name="Page-1">
+    <mxGraphModel dx="800" dy="600" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="400" pageHeight="200" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="n1" value="Self overwrite" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="160" height="60" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
+`;
+
+const runScript = (script, args, cwd) =>
+  spawnSync(process.execPath, [path.join(ROOT, "scripts", script), ...args], {
+    encoding: "utf8",
+    cwd,
+    timeout: 180000,
+  });
+
+test("High 2: out/ 配下の実走査ファイルを大文字小文字違い・symlink の別名で --json-out 指定しても exit(1)", async (t) => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-identity-"));
+  try {
+    // スキャナが実際に見るファイルを out/ の下に置く（昔は照合だけが out を飛ばしていた）
+    const real = path.join(tmp, "proj", "out", "ecommerce.sql");
+    await fs.mkdir(path.dirname(real), { recursive: true });
+    const sqlBody =
+      "CREATE TABLE orders (\n  id BIGINT PRIMARY KEY,\n  total INTEGER NOT NULL\n);\n";
+    await fs.writeFile(real, sqlBody, "utf8");
+    const xml = path.join(tmp, "er.drawio");
+
+    const aliases = [];
+    if (probeCaseInsensitiveFs(path.dirname(real))) {
+      aliases.push(["大文字小文字違い", path.join(tmp, "proj", "out", "ECOMMERCE.SQL")]);
+    }
+    const link = path.join(tmp, "latest.sql");
+    if (await trySymlink(real, link)) aliases.push(["symlink", link]);
+    if (aliases.length === 0) {
+      t.skip("大文字小文字同一視も symlink 作成もできない環境のためスキップ");
+      return;
+    }
+
+    for (const [label, alias] of aliases) {
+      const r = runScript(
+        "build-er.mjs",
+        ["--schema", path.join(tmp, "proj"), "--json-out", alias, "--xml-out", xml, "-o", `${xml}.png`],
+        tmp
+      );
+      assert.equal(r.status, 1, `${label}の別名指定が exit(1) になりませんでした:\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /--json-out/, `${label}: どちらの出力先が原因か出ていません: ${r.stderr}`);
+      assert.match(r.stderr, /ecommerce\.sql/, `${label}: 実際に走査した入力名が示されていません: ${r.stderr}`);
+      assert.equal(await fs.readFile(real, "utf8"), sqlBody, `${label}: 入力 SQL が書き換えられています`);
+      assert.ok(!fsSync.existsSync(xml), `${label}: 検査前に .drawio / PNG を作っています`);
+    }
+
+    // 別名の検査は「実走査した一覧」を見ているので、out/ 配下でも守られる
+    const okXml = path.join(tmp, "ok.drawio");
+    const okRun = runScript(
+      "build-er.mjs",
+      ["--schema", path.join(tmp, "proj"), "--json-out", path.join(tmp, "ok.json"), "--xml-out", okXml, "-o", path.join(tmp, "ok.png")],
+      tmp
+    );
+    assert.equal(okRun.status, 0, `別名指定のない生成が失敗しました:\n${okRun.stdout}\n${okRun.stderr}`);
+    assert.match(await fs.readFile(path.join(tmp, "ok.json"), "utf8"), /orders/);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("High 3: scan-schema / scan-terraform / scan-classes は -o に入力を指定したら exit(1) で入力は無傷", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-scancli-"));
+  try {
+    // --- scan-schema: 位置引数の SQL そのものへ -o ---
+    const sql = path.join(tmp, "schema.sql");
+    const sqlBody = "CREATE TABLE users (\n  id BIGINT PRIMARY KEY\n);\n";
+    await fs.writeFile(sql, sqlBody, "utf8");
+    const r1 = runScript("scan-schema.mjs", [sql, "-o", sql], tmp);
+    assert.equal(r1.status, 1, `scan-schema: exit(1) になりません\n${r1.stdout}\n${r1.stderr}`);
+    assert.match(r1.stderr, /--output/, `scan-schema: 出力先の役割が出ていません: ${r1.stderr}`);
+    assert.equal(await fs.readFile(sql, "utf8"), sqlBody, "scan-schema: 入力 SQL が書き換えられています");
+
+    // --- scan-terraform: --tf-dir 配下（ディレクトリ指定でも実走査ファイル）へ -o ---
+    const tfDir = path.join(tmp, "tf");
+    await fs.mkdir(tfDir, { recursive: true });
+    const tf = path.join(tfDir, "main.tf");
+    const tfBody = 'resource "aws_lambda_function" "a" {\n  function_name = "a"\n}\n';
+    await fs.writeFile(tf, tfBody, "utf8");
+    const r2 = runScript("scan-terraform.mjs", ["--tf-dir", tfDir, "-o", tf], tmp);
+    assert.equal(r2.status, 1, `scan-terraform: exit(1) になりません\n${r2.stdout}\n${r2.stderr}`);
+    assert.match(r2.stderr, /--output/, `scan-terraform: 出力先の役割が出ていません: ${r2.stderr}`);
+    assert.equal(await fs.readFile(tf, "utf8"), tfBody, "scan-terraform: 入力 .tf が書き換えられています");
+
+    // --- scan-classes: --src-dir 配下のソースへ -o（symlink 別名も含める） ---
+    const srcDir = path.join(tmp, "src");
+    await fs.mkdir(srcDir, { recursive: true });
+    const ts = path.join(srcDir, "model.ts");
+    const tsBody = "export class Model {\n  id: string = '';\n}\n";
+    await fs.writeFile(ts, tsBody, "utf8");
+    const tsAlias = path.join(srcDir, "alias.ts");
+    const madeLink = await trySymlink(ts, tsAlias);
+    const r3 = runScript("scan-classes.mjs", ["--src-dir", srcDir, "-o", madeLink ? tsAlias : ts], tmp);
+    assert.equal(r3.status, 1, `scan-classes: exit(1) になりません\n${r3.stdout}\n${r3.stderr}`);
+    assert.match(r3.stderr, /--output/, `scan-classes: 出力先の役割が出ていません: ${r3.stderr}`);
+    assert.equal(await fs.readFile(ts, "utf8"), tsBody, "scan-classes: 入力 .ts が書き換えられています");
+    if (madeLink) {
+      const r3b = runScript("scan-classes.mjs", ["--src-dir", srcDir, "-o", ts], tmp);
+      assert.equal(r3b.status, 1, `scan-classes（実パス指定）: exit(1) になりません\n${r3b.stderr}`);
+    }
+
+    // 正常系: 入力を含まない別ディレクトリへの -o は従来どおり動く
+    const outJson = path.join(tmp, "out", "schema.json");
+    const okRun = runScript("scan-schema.mjs", [sql, "-o", outJson], tmp);
+    assert.equal(okRun.status, 0, `scan-schema(正常系): 失敗\n${okRun.stdout}\n${okRun.stderr}`);
+    assert.ok(fsSync.existsSync(outJson), "scan-schema(正常系): JSON が作られていません");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("High 4: .drawio.png を png 変換の入力にすると、既定出力先・明示 -o・別名・--extract-xml すべて exit(1) で埋め込み XML は無傷", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-selfpng-"));
+  try {
+    const src = path.join(tmp, "diagram.drawio");
+    await fs.writeFile(src, MINIMAL_DRAWIO, "utf8");
+    const made = runScript("drawio2png.mjs", [src, "-o", path.join(tmp, "diagram.drawio.png")], tmp);
+    assert.equal(made.status, 0, `.drawio.png の準備に失敗\n${made.stdout}\n${made.stderr}`);
+    const png = path.join(tmp, "diagram.drawio.png");
+    const original = fsSync.readFileSync(png);
+    const embedded = extractDrawioXmlFromPng(original);
+    assert.ok(embedded, "埋め込み XML が取り出せません（前提の PNG が作れていません）");
+
+    const guards = [["既定出力先（-o なし）", ["diagram.drawio.png"]], ["明示 -o", ["diagram.drawio.png", "-o", "diagram.drawio.png"]]];
+    if (probeCaseInsensitiveFs(tmp)) {
+      guards.push(["大文字小文字違いの -o", ["diagram.drawio.png", "-o", "DIAGRAM.Drawio.PNG"]]);
+    }
+    if (await trySymlink(png, path.join(tmp, "latest.png"))) {
+      guards.push(["symlink 別名への -o", ["diagram.drawio.png", "-o", "latest.png"]]);
+    }
+    for (const [label, args] of guards) {
+      const r = runScript("drawio2png.mjs", args, tmp);
+      assert.equal(r.status, 1, `${label}が exit(1) になりません\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /入力ファイルと同一/, `${label}: 理由がエラーメッセージに出ていません: ${r.stderr}`);
+      assert.ok(fsSync.readFileSync(png).equals(original), `${label}: 変換前に入力を壊しています`);
+      assert.equal(extractDrawioXmlFromPng(fsSync.readFileSync(png)), embedded, `${label}: 埋め込み XML が失われています`);
+    }
+
+    // --extract-xml の -o も入力を指したら止まる
+    const rx = runScript("drawio2png.mjs", ["diagram.drawio.png", "--extract-xml", "-o", "diagram.drawio.png"], tmp);
+    assert.equal(rx.status, 1, `--extract-xml の自己上書きが exit(1) になりません\n${rx.stdout}\n${rx.stderr}`);
+    assert.ok(fsSync.readFileSync(png).equals(original), "--extract-xml 側で入力を壊しています");
+
+    // --all-pages も既定出力先が自分自身なら止まる
+    const ra = runScript("drawio2png.mjs", ["diagram.drawio.png", "--all-pages"], tmp);
+    assert.equal(ra.status, 1, `--all-pages の自己上書きが exit(1) になりません\n${ra.stdout}\n${ra.stderr}`);
+    assert.ok(fsSync.readFileSync(png).equals(original), "--all-pages 側で入力を壊しています");
+
+    // 正常系: .drawio -> .png（既定名 / 明示名）と、別名の PNG への書き出しは今までどおり動く
+    const ok1 = runScript("drawio2png.mjs", ["diagram.drawio"], tmp);
+    assert.equal(ok1.status, 0, `.drawio -> .png(既定名) が失敗\n${ok1.stdout}\n${ok1.stderr}`);
+    assert.ok(fsSync.existsSync(path.join(tmp, "diagram.png")), "diagram.png が作られていません");
+    const ok2 = runScript("drawio2png.mjs", ["diagram.drawio.png", "-o", "copy.drawio.png"], tmp);
+    assert.equal(ok2.status, 0, `別名の PNG への書き出しが失敗\n${ok2.stdout}\n${ok2.stderr}`);
+    assert.ok(fsSync.existsSync(path.join(tmp, "copy.drawio.png")), "copy.drawio.png が作られていません");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("High 5: Pass の Result に Task の形を書いても Invoke 線は作らない（Parallel.Branches と Map.ItemProcessor は結ぶ）", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-pass-"));
+  const TF = `
+resource "aws_lambda_function" "worker" {
+  function_name = "worker"
+}
+
+resource "aws_lambda_function" "mapper" {
+  function_name = "mapper"
+}
+
+resource "aws_lambda_function" "mailer" {
+  function_name = "mailer"
+}
+
+resource "aws_sfn_state_machine" "flow" {
+  name = "flow"
+  definition = jsonencode({
+    "StartAt" : "Fan",
+    "States" : {
+      "Fan" : {
+        "Type" : "Parallel",
+        "Branches" : [
+          { "Type" : "Task", "Resource" : "\${aws_lambda_function.worker.arn}", "End" : true }
+        ],
+        "Next" : "Each"
+      },
+      "Each" : {
+        "Type" : "Map",
+        "ItemProcessor" : {
+          "StartAt" : "M",
+          "States" : {
+            "M" : { "Type" : "Task", "Resource" : "\${aws_lambda_function.mapper.arn}", "End" : true }
+          }
+        },
+        "End" : true
+      },
+      "Quiet" : {
+        "Type" : "Pass",
+        "Result" : {
+          "Type" : "Task",
+          "Resource" : "\${aws_lambda_function.mailer.arn}",
+          "Parameters" : { "FunctionName" : "\${aws_lambda_function.mailer.function_name}" }
+        },
+        "End" : true
+      }
+    }
+  })
+}
+`;
+  try {
+    await fs.writeFile(path.join(tmp, "main.tf"), TF, "utf8");
+    const spec = await scanTerraformDirectory(tmp, {});
+    const targets = spec.edges
+      .filter((e) => e.from === "aws_sfn_state_machine_flow")
+      .map((e) => `${e.to}=${e.label}`);
+    assert.ok(
+      targets.includes("aws_lambda_function_worker=Invoke"),
+      `Parallel.Branches の Task が結ばれません: ${targets}`
+    );
+    assert.ok(
+      targets.includes("aws_lambda_function_mapper=Invoke"),
+      `Map.ItemProcessor の Task が結ばれません: ${targets}`
+    );
+    assert.ok(
+      !spec.edges.some((e) => e.to === "aws_lambda_function_mailer" || e.from === "aws_lambda_function_mailer"),
+      `Pass の Result 内にある Task の形を執行の根拠にしています: ${JSON.stringify(spec.edges)}`
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("High 6: glue リソースは属性名で結び、depends_on は接続の根拠にしない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-glue-"));
+  const TF = `
+resource "aws_apigatewayv2_api" "gw" {
+  name = "gw"
+}
+
+resource "aws_lambda_function" "worker" {
+  function_name = "worker"
+}
+
+resource "aws_lambda_function" "mailer" {
+  function_name = "mailer"
+}
+
+resource "aws_apigatewayv2_integration" "to_worker" {
+  api_id           = aws_apigatewayv2_api.gw.id
+  integration_type = "AWS_PROXY"
+  depends_on       = [aws_lambda_function.mailer]
+  integration_uri  = aws_lambda_function.worker.invoke_arn
+}
+`;
+  try {
+    await fs.writeFile(path.join(tmp, "main.tf"), TF, "utf8");
+    const spec = await scanTerraformDirectory(tmp, {});
+    const edge = spec.edges.find(
+      (e) => e.from === "aws_apigatewayv2_api_gw" && e.to === "aws_lambda_function_worker"
+    );
+    assert.ok(edge, `api_id + integration_uri から API -> Lambda の線が作れません: ${JSON.stringify(spec.edges)}`);
+    assert.equal(edge.label, "Invoke");
+    assert.ok(
+      !spec.edges.some((e) => e.from === "aws_lambda_function_mailer" || e.to === "aws_lambda_function_mailer"),
+      `depends_on の先が接続されています: ${JSON.stringify(spec.edges)}`
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium 2: 同名型が複数ファイルにあるとき、extends の親は相対 import 先の宣言で解決する", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-import-"));
+  try {
+    // a-legacy.ts が走査順で先に来るため、import を見ない実装はそちらを親に選ぶ
+    await fs.writeFile(
+      path.join(tmp, "a-legacy.ts"),
+      "export class Base {\n  legacyOnly: string = '';\n}\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "b.ts"),
+      "export class Base {\n  importOnly: string = '';\n}\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "impl.ts"),
+      'import { Base } from "./b";\n\nexport class Impl extends Base {}\n',
+      "utf8"
+    );
+    const spec = await scanDirectory(tmp, {});
+    const rel = spec.relations.find((r) => r.from === "Impl" && r.type === "inheritance");
+    assert.ok(rel, `Impl の inheritance が作れません: ${JSON.stringify(spec.relations)}`);
+    const parent = spec.classes.find((c) => c.id === rel.to);
+    assert.ok(parent, "親クラスが spec に見当たりません");
+    assert.equal(parent.name, "Base (b.ts)", "import 先（b.ts）ではなく走査順で先の Base を親にしています");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium 1: writeFileAtomic は同じディレクトリの一時ファイルから rename し、失敗時も一時ファイルを残さない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-atomic-"));
+  try {
+    const target = path.join(tmp, "out.json");
+    await writeFileAtomic(target, '{"a":1}\n');
+    assert.equal(await fs.readFile(target, "utf8"), '{"a":1}\n');
+    assert.deepEqual(await fs.readdir(tmp), ["out.json"], "一時ファイルが残っています");
+
+    // 既存ファイルの上書きも rename で置き換わる
+    await writeFileAtomic(target, '{"a":2}\n');
+    assert.equal(await fs.readFile(target, "utf8"), '{"a":2}\n');
+    assert.deepEqual(await fs.readdir(tmp), ["out.json"], "上書き後に一時ファイルが残っています");
+
+    // 書き込み先ディレクトリが無い場合は呼び出し側で mkdir する前提（エラーはそのまま伝える）
+    await assert.rejects(() => writeFileAtomic(path.join(tmp, "missing", "x.json"), "x"));
+    assert.deepEqual(await fs.readdir(tmp), ["out.json"], "失敗時に一時ファイルが残っています");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+// ---------------------------------------------------------------------------
+// 11. Codex Turn 5 レビューの High / Medium 指摘への回帰テスト
+// ---------------------------------------------------------------------------
+
+/** 生パス表記を崩さず成分を連結する（path.join は `..` を字句で折畳んでしまうため）。 */
+const rawJoin = (...parts) => parts.join(path.sep);
+
+test("High: symlink を跨ぐ `..` 表記の出力先も exit(1)。実体は無傷で、正当な別名出力は通る", async (t) => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-dotdot-"));
+  try {
+    // `link` が別階層（sub1/sub2）へのディレクトリ symlink なので、
+    // `link/..` は OS に解決させると `sub1` になる（path.resolve は `link` を潰して `tmp` にする）
+    await fs.mkdir(path.join(tmp, "sub1", "sub2"), { recursive: true });
+    const link = path.join(tmp, "link");
+    const madeLink = await trySymlink(path.join("sub1", "sub2"), link);
+    if (!madeLink) {
+      t.skip("symlink を作成できない環境のためスキップ");
+      return;
+    }
+
+    // --- ER: `link/../target.sql` を --json-out に指定（実は sub1/target.sql そのもの） ---
+    const sqlReal = path.join(tmp, "sub1", "target.sql");
+    const sqlBody = "CREATE TABLE orders (\n  id BIGINT PRIMARY KEY,\n  total INTEGER NOT NULL\n);\n";
+    await fs.writeFile(sqlReal, sqlBody, "utf8");
+    const erXml = path.join(tmp, "er.drawio");
+    const dotDotSql = rawJoin("link", "..", "target.sql");
+    const erRun = runScript(
+      "build-er.mjs",
+      ["--schema", tmp, "--json-out", dotDotSql, "--xml-out", erXml, "-o", `${erXml}.png`],
+      tmp
+    );
+    assert.equal(erRun.status, 1, `link/../target.sql が exit(1) になりません:\n${erRun.stdout}\n${erRun.stderr}`);
+    assert.match(erRun.stderr, /--json-out/, `どちらの出力先が原因か出ていません: ${erRun.stderr}`);
+    assert.match(erRun.stderr, /target\.sql/, `衝突した入力名が示されていません: ${erRun.stderr}`);
+    assert.equal(await fs.readFile(sqlReal, "utf8"), sqlBody, "入力 SQL が書き換えられています");
+    assert.ok(!fsSync.existsSync(erXml), "検査前に .drawio / PNG を作っています");
+
+    // --- drawio2png: `link/../diagram.drawio.png` を -o に指定（入力 PNG そのもの） ---
+    const drawio = path.join(tmp, "sub1", "diagram.drawio");
+    await fs.writeFile(drawio, MINIMAL_DRAWIO, "utf8");
+    const made = runScript(
+      "drawio2png.mjs",
+      [rawJoin("sub1", "diagram.drawio"), "-o", rawJoin("sub1", "diagram.drawio.png")],
+      tmp
+    );
+    assert.equal(made.status, 0, `.drawio.png の準備に失敗\n${made.stdout}\n${made.stderr}`);
+    const pngReal = path.join(tmp, "sub1", "diagram.drawio.png");
+    const original = fsSync.readFileSync(pngReal);
+    const embedded = extractDrawioXmlFromPng(original);
+    assert.ok(embedded, "埋め込み XML が取り出せません（前提の PNG が作れていません）");
+
+    const dotDotPng = rawJoin("link", "..", "diagram.drawio.png");
+    for (const [label, args] of [
+      ["実パスを入力 / `..` 別名を出力", [rawJoin("sub1", "diagram.drawio.png"), "-o", dotDotPng]],
+      ["`..` 別名を入力 / 実パスを出力", [dotDotPng, "-o", rawJoin("sub1", "diagram.drawio.png")]],
+      ["`..` 別名どうし（-o なしの既定出力先）", [dotDotPng]],
+    ]) {
+      const r = runScript("drawio2png.mjs", args, tmp);
+      assert.equal(r.status, 1, `${label} が exit(1) になりません\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /入力ファイルと同一/, `${label}: 理由がエラーメッセージに出ていません: ${r.stderr}`);
+      assert.ok(fsSync.readFileSync(pngReal).equals(original), `${label}: 変換前に入力を壊しています`);
+      assert.equal(
+        extractDrawioXmlFromPng(fsSync.readFileSync(pngReal)),
+        embedded,
+        `${label}: 埋め込み XML が失われています`
+      );
+    }
+
+    // --extract-xml の -o も `..` 別名なら同じ実体として弾ける
+    const rx = runScript(
+      "drawio2png.mjs",
+      [rawJoin("sub1", "diagram.drawio.png"), "--extract-xml", "-o", dotDotPng],
+      tmp
+    );
+    assert.equal(rx.status, 1, `--extract-xml の .. 別名指定が exit(1) になりません\n${rx.stderr}`);
+    assert.ok(fsSync.readFileSync(pngReal).equals(original), "--extract-xml 側で入力を壊しています");
+
+    // 正常系: 同じ `..` 表記でも別ファイルへの出力は従来どおり通る（過剰検出の防止）
+    const okRun = runScript(
+      "drawio2png.mjs",
+      [rawJoin("sub1", "diagram.drawio"), "-o", rawJoin("link", "..", "copy.drawio.png")],
+      tmp
+    );
+    assert.equal(okRun.status, 0, `別名ディレクトリ経由の正常系が失敗\n${okRun.stdout}\n${okRun.stderr}`);
+    assert.ok(
+      fsSync.existsSync(path.join(tmp, "sub1", "copy.drawio.png")),
+      "`link/../copy.drawio.png` が symlink を辿った先（sub1/）に作られていません"
+    );
+    const erOk = runScript(
+      "build-er.mjs",
+      [
+        "--schema", tmp,
+        "--json-out", rawJoin("link", "..", "sub2", "er.json"),
+        "--xml-out", rawJoin("link", "..", "sub2", "er.drawio"),
+        "-o", rawJoin("link", "..", "sub2", "er.drawio.png"),
+      ],
+      tmp
+    );
+    assert.equal(erOk.status, 0, `正常系（ER / .. 経由の別名出力）が失敗\n${erOk.stdout}\n${erOk.stderr}`);
+    assert.ok(fsSync.existsSync(path.join(tmp, "sub1", "sub2", "er.json")), "er.json が作られていません");
+    assert.deepEqual(await fs.readFile(sqlReal, "utf8"), sqlBody, "正常系で入力 SQL が書き換わっています");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("High: writeFileAtomic は予測可能な .tmp-<pid> を一切触らず、同一 target への並行書き込みも安全", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-atomic2-"));
+  try {
+    const target = path.join(tmp, "out.json");
+    // 旧実装が使っていた予測可能な一時ファイル名を、中身入りの他人ファイルとして用意する
+    const decoy = `${target}.tmp-${process.pid}`;
+    const decoyBody = "PRE-EXISTING DECOY";
+    await fs.writeFile(decoy, decoyBody, "utf8");
+
+    await writeFileAtomic(target, "new\n");
+    assert.equal(await fs.readFile(target, "utf8"), "new\n", "本体が更新されていません");
+    assert.equal(await fs.readFile(decoy, "utf8"), decoyBody, "既存の .tmp-<pid> が上書き・切り詰められています");
+
+    // 別名（別 pid 風）の一時ファイルも同様に無傷
+    const other = `${target}.tmp-999999`;
+    await fs.writeFile(other, decoyBody, "utf8");
+    await writeFileAtomic(target, "new2\n");
+    assert.equal(await fs.readFile(other, "utf8"), decoyBody, "既存の .tmp-* が消えています");
+
+    // 一時ファイルの残骸は 0（decoy 2 つと本体だけ）
+    assert.deepEqual(
+      (await fs.readdir(tmp)).sort(),
+      [path.basename(decoy), path.basename(other), "out.json"].sort(),
+      "一時ファイルが残っています"
+    );
+
+    // 同一プロセス内から同じ target へ並行実行しても取り残し・エラーなし
+    const payloads = ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"];
+    await Promise.all(payloads.map((p) => writeFileAtomic(target, p)));
+    assert.ok(payloads.includes(await fs.readFile(target, "utf8")), "並行書き込みの結果がどれとも一致しません");
+    assert.deepEqual(
+      (await fs.readdir(tmp)).sort(),
+      [path.basename(decoy), path.basename(other), "out.json"].sort(),
+      "並行書き込み後に一時ファイルが残っています"
+    );
+    assert.equal(await fs.readFile(decoy, "utf8"), decoyBody, "並行書き込みで .tmp-<pid> を触っています");
+
+    // 失敗時（親ディレクトリが無い）も自分の一時ファイルを置き去りにせず、decoy にも触れない
+    await assert.rejects(() => writeFileAtomic(path.join(tmp, "missing", "x.json"), "x"));
+    assert.deepEqual(
+      (await fs.readdir(tmp)).sort(),
+      [path.basename(decoy), path.basename(other), "out.json"].sort(),
+      "失敗時に一時ファイルが残っています"
+    );
+    assert.equal(await fs.readFile(decoy, "utf8"), decoyBody, "失敗時に .tmp-<pid> を触っています");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: クラススキャナはシンボル単位の import で親を解決する（Helper だけ import した a.ts の Base を選ばない）", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-importsym-"));
+  try {
+    await fs.writeFile(
+      path.join(tmp, "a.ts"),
+      "export class Helper {}\n\nexport class Base {\n  fromA: string = '';\n}\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "b.ts"),
+      "export class Base {\n  fromB: string = '';\n}\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "c.ts"),
+      'import { Helper } from "./a";\nimport { Base } from "./b";\n\nexport class Child extends Base {}\n',
+      "utf8"
+    );
+    const spec = await scanDirectory(tmp, {});
+    const rel = spec.relations.find((r) => r.from === "Child" && r.type === "inheritance");
+    assert.ok(rel, `Child の inheritance が作れません: ${JSON.stringify(spec.relations)}`);
+    const parent = spec.classes.find((c) => c.id === rel.to);
+    assert.ok(parent, "親クラスが spec に見当たりません");
+    assert.equal(parent.name, "Base (b.ts)", "import 元（b.ts）ではなく Helper を import した a.ts の Base を親にしています");
+    assert.equal(
+      spec.relations.filter((r) => r.from === "Child").length,
+      1,
+      `Child の親が複数結ばれています: ${JSON.stringify(spec.relations)}`
+    );
+
+    // `import { Base as Parent }` の別名 import も同じ規則で解決する
+    await fs.writeFile(
+      path.join(tmp, "d.ts"),
+      'import { Base as Parent } from "./a";\n\nexport class AliasChild extends Parent {}\n',
+      "utf8"
+    );
+    const spec2 = await scanDirectory(tmp, {});
+    const rel2 = spec2.relations.find((r) => r.from === "AliasChild" && r.type === "inheritance");
+    assert.ok(rel2, `AliasChild の inheritance が作れません: ${JSON.stringify(spec2.relations)}`);
+    const parent2 = spec2.classes.find((c) => c.id === rel2.to);
+    assert.equal(parent2.name, "Base", "別名 import（a.ts の Base）が解決されていません");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("High: POSIX ではバックスラッシュ付きファイル名をディレクトリ区切りに分割しない", async () => {
+  if (process.platform === "win32") return;
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-bslash-"));
+  try {
+    const realTmp = await fs.realpath(tmp);
+    const nameWithSlash = "example\\diagram.svg";
+    const target = path.join(tmp, nameWithSlash);
+    const resolved = resolveWriteTarget(target);
+    assert.equal(resolved, path.join(realTmp, nameWithSlash));
+
+    // 単体コンバーターもバックスラッシュをディレクトリ扱いせず直下に書く（別フォルダ example/ に逃げない）
+    const xmlIn = path.join(tmp, "in.drawio");
+    await fs.writeFile(
+      xmlIn,
+      '<mxfile><diagram id="d1" name="Page-1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="n1" value="ok" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="80" height="40" as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>',
+      "utf8"
+    );
+    const r = cli(["png", xmlIn, "-o", target]);
+    assert.equal(r.status, 0, r.stderr);
+    const entries = await fs.readdir(tmp);
+    assert.ok(entries.includes(nameWithSlash), `ファイル名が分割されました: ${JSON.stringify(entries)}`);
+    assert.ok(!entries.includes("example"), "example ディレクトリが誤って作られました");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: symlink/../newdir/out.json のように実体側の親が未作成でも出力ディレクトリを正しく作る", async (t) => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-symlink-mkdir-"));
+  try {
+    const sub1 = path.join(tmp, "sub1");
+    const sub2 = path.join(sub1, "sub2");
+    await fs.mkdir(sub2, { recursive: true });
+    if (!(await trySymlink(sub2, path.join(tmp, "link")))) {
+      t.skip("symlink を作成できない環境のためスキップ");
+      return;
+    }
+
+    const sql = path.join(tmp, "schema.sql");
+    await fs.writeFile(sql, "CREATE TABLE users (id int PRIMARY KEY);\n", "utf8");
+
+    // path.join() は字句的に "link/.." を潰してしまうため、生の文字列で渡す
+    const jsonOut = `${tmp}${path.sep}link${path.sep}..${path.sep}newdir${path.sep}result.json`;
+    const pngOut = `${tmp}${path.sep}link${path.sep}..${path.sep}newdir${path.sep}er.drawio.png`;
+    const r = cli(["er", "--schema", sql, "--json-out", jsonOut, "-o", pngOut]);
+    assert.equal(r.status, 0, r.stderr);
+
+    const realJson = path.join(sub1, "newdir", "result.json");
+    const realPng = path.join(sub1, "newdir", "er.drawio.png");
+    assert.ok(fsSync.existsSync(realJson), "symlink 先の親 sub1/newdir/result.json が作られていません");
+    assert.ok(fsSync.existsSync(realPng), "symlink 先の親 sub1/newdir/er.drawio.png が作られていません");
+    assert.equal(fsSync.existsSync(path.join(tmp, "newdir")), false, "字句折畳み側の誤ったディレクトリが作られました");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: 同一ファイルに親クラスがあるとき、他シンボルを import した別モジュールの同名クラスに負けない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-samefile-"));
+  try {
+    await fs.writeFile(
+      path.join(tmp, "a.ts"),
+      "export class Helper {}\nexport class Base { fromA: string = ''; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "c.ts"),
+      'import { Helper } from "./a";\nexport class Base { fromC: string = ""; }\nexport class Child extends Base {}\n',
+      "utf8"
+    );
+    const spec = await scanDirectory(tmp, {});
+    const child = spec.classes.find((c) => c.name === "Child");
+    assert.ok(child);
+    const rel = spec.relations.find((r) => r.from === child.id && r.type === "inheritance");
+    assert.ok(rel, `inheritance がありません: ${JSON.stringify(spec.relations)}`);
+    const parent = spec.classes.find((c) => c.id === rel.to);
+    assert.equal(parent.name, "Base (c.ts)", `同一ファイルの Base ではなく ${parent.name} に結ばれました`);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: export default class と名前を変えた default import でも継承線が落ちない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-default-import-"));
+  try {
+    await fs.writeFile(
+      path.join(tmp, "a.ts"),
+      "export default class Base { aProp: string = ''; }\nexport class Helper {}\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "b.ts"),
+      "export class Other {}\nexport default class Base { bProp: string = ''; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "c.ts"),
+      'import Parent from "./b";\nexport class Child extends Parent {}\n',
+      "utf8"
+    );
+    const spec = await scanDirectory(tmp, {});
+    const child = spec.classes.find((c) => c.name === "Child");
+    assert.ok(child);
+    const rel = spec.relations.find((r) => r.from === child.id && r.type === "inheritance");
+    assert.ok(rel, `別名 default import の inheritance が欠落しています: ${JSON.stringify(spec.relations)}`);
+    const parent = spec.classes.find((c) => c.id === rel.to);
+    assert.equal(parent.name, "Base (b.ts)", `b.ts の default export ではなく ${parent.name} が選ばれました`);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: findImportedSymbol は識別子の大文字小文字を厳密に区別する (Base as base がローカル Base を隠さない)", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-case-ident-"));
+  try {
+    await fs.writeFile(
+      path.join(tmp, "a.ts"),
+      "export class Base { fromA: string = ''; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "c.ts"),
+      'import { Base as base } from "./a";\nexport class Base { fromC: string = ""; }\nexport class Child extends Base {}\n',
+      "utf8"
+    );
+    const spec = await scanDirectory(tmp, {});
+    const child = spec.classes.find((c) => c.name === "Child");
+    assert.ok(child);
+    const rel = spec.relations.find((r) => r.from === child.id && r.type === "inheritance");
+    assert.ok(rel, `inheritance がありません: ${JSON.stringify(spec.relations)}`);
+    const parent = spec.classes.find((c) => c.id === rel.to);
+    assert.equal(parent.name, "Base (c.ts)", `import { Base as base } により別ファイル ${parent.name} が選ばれました`);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: 文字列・テンプレートリテラル内の疑似 import 文に惑わされない", async () => {
+  const tmp1 = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-str-import-1-"));
+  const tmp2 = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-str-import-2-"));
+  try {
+    await fs.writeFile(
+      path.join(tmp1, "a.ts"),
+      "export class Base { fromA: string = ''; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp1, "b.ts"),
+      "export class Base { fromB: string = ''; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp1, "c.ts"),
+      'import { Base } from "./b";\nconst msg = \'import { Base } from "./a"\';\nconst tpl = `import { Base } from "./a"`;\nexport class Child extends Base {}\n',
+      "utf8"
+    );
+    const spec1 = await scanDirectory(tmp1, {});
+    const child1 = spec1.classes.find((c) => c.name === "Child");
+    assert.ok(child1);
+    const rel1 = spec1.relations.find((r) => r.from === child1.id && r.type === "inheritance");
+    assert.ok(rel1);
+    const parent1 = spec1.classes.find((c) => c.id === rel1.to);
+    assert.equal(parent1.name, "Base (b.ts)", `文字列内の疑似 import "./a" で ${parent1.name} に上書きされました`);
+
+    await fs.writeFile(
+      path.join(tmp2, "a.ts"),
+      "export class Base { fromA: string = ''; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp2, "c.ts"),
+      'const msg = \'import { Base } from "./a"\';\nexport class Base {}\nexport class Child extends Base {}\n',
+      "utf8"
+    );
+    const spec2 = await scanDirectory(tmp2, {});
+    const child2 = spec2.classes.find((c) => c.name === "Child");
+    assert.ok(child2);
+    const rel2 = spec2.relations.find((r) => r.from === child2.id && r.type === "inheritance");
+    assert.ok(rel2);
+    const parent2 = spec2.classes.find((c) => c.id === rel2.to);
+    assert.equal(parent2.name, "Base (c.ts)", `ローカル Base ではなく ${parent2.name} が選ばれました`);
+  } finally {
+    await fs.rm(tmp1, { recursive: true, force: true });
+    await fs.rm(tmp2, { recursive: true, force: true });
+  }
+});
+
+test("Medium / Low: export { Base as default } を認識し、export { Local as default } from './a' を自モジュールの default export と誤認しない", async () => {
+  const tmp1 = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-export-as-def-1-"));
+  const tmp2 = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-export-as-def-2-"));
+  try {
+    await fs.writeFile(
+      path.join(tmp1, "a.ts"),
+      "export class Other {}\nexport class Base { fromA: string = ''; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp1, "b.ts"),
+      "export class Helper {}\nexport class Base { fromB: string = ''; }\nexport { Base as default };\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp1, "c.ts"),
+      'import Parent from "./b";\nexport class Child extends Parent {}\n',
+      "utf8"
+    );
+    const spec1 = await scanDirectory(tmp1, {});
+    const child1 = spec1.classes.find((c) => c.name === "Child");
+    assert.ok(child1);
+    const rel1 = spec1.relations.find((r) => r.from === child1.id && r.type === "inheritance");
+    assert.ok(rel1, `export { Base as default } の inheritance が欠落しています: ${JSON.stringify(spec1.relations)}`);
+    const parent1 = spec1.classes.find((c) => c.id === rel1.to);
+    assert.equal(parent1.name, "Base (b.ts)", `export { Base as default } ではなく ${parent1.name} が選ばれました`);
+
+    // b.ts 自身にも Local クラスがある状態で `export { Local as default } from "./a"` がある場合、
+    // b.ts 側の Local (b.ts) ではなく、再エクスポート先 a.ts の Local へ正しく辿り着く。
+    await fs.writeFile(
+      path.join(tmp2, "a.ts"),
+      "export class Local { fromA: string = ''; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp2, "b.ts"),
+      'export class Local { fromB: string = \'\'; }\nexport class Helper {}\nexport { Local as default } from "./a";\n',
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp2, "c.ts"),
+      'import Parent from "./b";\nexport class Child extends Parent {}\n',
+      "utf8"
+    );
+    const spec2 = await scanDirectory(tmp2, {});
+    const child2 = spec2.classes.find((c) => c.name === "Child");
+    assert.ok(child2);
+    const rel2 = spec2.relations.find((r) => r.from === child2.id && r.type === "inheritance");
+    assert.ok(rel2, `export { Local as default } from "./a" の継承関係が解決されません: ${JSON.stringify(spec2.relations)}`);
+    const parent2 = spec2.classes.find((c) => c.id === rel2.to);
+    assert.equal(
+      parent2.name,
+      "Local",
+      `a.ts の Local ではなく b.ts 自身の ${parent2.name} に誤認されました`
+    );
+  } finally {
+    await fs.rm(tmp1, { recursive: true, force: true });
+    await fs.rm(tmp2, { recursive: true, force: true });
+  }
+});
+
+test("Medium: .mjs / .cjs 拡張子付き import 指定子から .mts / .cts ソースを解決できる", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-mts-esm-"));
+  try {
+    await fs.writeFile(
+      path.join(tmp, "a.mts"),
+      "export default class Base { fromA: string = ''; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "b.mts"),
+      "export class Helper {}\nexport default class Base { fromB: string = ''; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "c.mts"),
+      'import Parent from "./b.mjs";\nexport class Child extends Parent {}\n',
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "d.cts"),
+      "export default class CjsBase { fromD: string = ''; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "e.cts"),
+      'import CjsParent from "./d.cjs";\nexport class CjsChild extends CjsParent {}\n',
+      "utf8"
+    );
+    const spec = await scanDirectory(tmp, {});
+    const child = spec.classes.find((c) => c.name === "Child");
+    assert.ok(child);
+    const rel = spec.relations.find((r) => r.from === child.id && r.type === "inheritance");
+    assert.ok(rel, `./b.mjs -> b.mts の inheritance が欠落しています: ${JSON.stringify(spec.relations)}`);
+    const parent = spec.classes.find((c) => c.id === rel.to);
+    assert.equal(parent.name, "Base (b.mts)", `b.mts の default export ではなく ${parent.name} が選ばれました`);
+
+    const cjsChild = spec.classes.find((c) => c.name === "CjsChild");
+    assert.ok(cjsChild);
+    const cjsRel = spec.relations.find((r) => r.from === cjsChild.id && r.type === "inheritance");
+    assert.ok(cjsRel, `./d.cjs -> d.cts の inheritance が欠落しています: ${JSON.stringify(spec.relations)}`);
+    const cjsParent = spec.classes.find((c) => c.id === cjsRel.to);
+    assert.equal(cjsParent.name, "CjsBase");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: base.mts と base.cts が同居（同名 Base も含む）しても ./base.mjs は base.mts、./base.cjs は base.cts を選ぶ", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-mts-vs-cts-"));
+  try {
+    // base.cts が走査順で先に来るうえ両者に同名クラス Base があっても、拡張子系統で正しく切り分ける
+    await fs.writeFile(
+      path.join(tmp, "base.cts"),
+      "export default class Base { fromCts: string = ''; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "base.mts"),
+      "export default class Base { fromMts: string = ''; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "use-esm.mts"),
+      'import Parent from "./base.mjs";\nexport class EsmChild extends Parent {}\n',
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "use-cjs.cts"),
+      'import Parent from "./base.cjs";\nexport class CjsChild extends Parent {}\n',
+      "utf8"
+    );
+    const spec = await scanDirectory(tmp, {});
+    const esmChild = spec.classes.find((c) => c.name === "EsmChild");
+    const cjsChild = spec.classes.find((c) => c.name === "CjsChild");
+    assert.ok(esmChild && cjsChild);
+    const esmRel = spec.relations.find((r) => r.from === esmChild.id && r.type === "inheritance");
+    const cjsRel = spec.relations.find((r) => r.from === cjsChild.id && r.type === "inheritance");
+    assert.ok(esmRel && cjsRel, `継承関係が不足しています: ${JSON.stringify(spec.relations)}`);
+    assert.equal(spec.classes.find((c) => c.id === esmRel.to).name, "Base (base.mts)");
+    assert.equal(spec.classes.find((c) => c.id === cjsRel.to).name, "Base");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("High: NOTICE/・README.md/../NOTICE・missing/../NOTICE など非ディレクトリ経由の出力指定はすべて拒否し元ファイルを壊さない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-nondir-"));
+  try {
+    const noticePath = path.join(tmp, "NOTICE");
+    const readmePath = path.join(tmp, "README.md");
+    const noticeBody = "ORIGINAL NOTICE SENTINEL\n";
+    await fs.writeFile(noticePath, noticeBody, "utf8");
+    await fs.writeFile(readmePath, "# README\n", "utf8");
+    await fs.writeFile(path.join(tmp, "diagram.drawio"), MINIMAL_DRAWIO, "utf8");
+    await fs.writeFile(path.join(tmp, "sample.ts"), "export class Alpha {}\n", "utf8");
+    await fs.writeFile(path.join(tmp, "schema.sql"), "CREATE TABLE t (id INT PRIMARY KEY);\n", "utf8");
+
+    const invalidTargets = [
+      path.join(tmp, "NOTICE") + path.sep,
+      rawJoin(tmp, "README.md", "..", "NOTICE"),
+      rawJoin(tmp, "NOTICE", "."),
+      rawJoin(tmp, "missing", "..", "NOTICE"),
+    ];
+    for (const bad of invalidTargets) {
+      assert.throws(() => resolveWriteTarget(bad), { code: /ENOTDIR|ENOENT|EISDIR/ }, `resolveWriteTarget が ${bad} を許しました`);
+      await assert.rejects(() => writeFileAtomic(bad, "CORRUPTED\n"), { code: /ENOTDIR|ENOENT|EISDIR/ });
+    }
+
+    for (const relBad of [
+      `NOTICE${path.sep}`,
+      rawJoin("README.md", "..", "NOTICE"),
+      rawJoin("missing", "..", "NOTICE"),
+    ]) {
+      const pngRun = runScript("drawio2png.mjs", ["diagram.drawio", "-o", relBad], tmp);
+      assert.equal(pngRun.status, 1, `drawio2png -o ${relBad} が exit(1) になりません`);
+
+      const clsRun = runScript("scan-classes.mjs", ["--src-dir", tmp, "-o", relBad], tmp);
+      assert.equal(clsRun.status, 1, `scan-classes -o ${relBad} が exit(1) になりません`);
+    }
+
+    // --json-out は正当でも後続の --xml-out が README.md/../NOTICE なら、--json-out も 1 バイトも書かずに exit(1)
+    const okJson = path.join(tmp, "ok.json");
+    const erRun = runScript(
+      "build-er.mjs",
+      ["--schema", "schema.sql", "--json-out", okJson, "--xml-out", rawJoin("README.md", "..", "NOTICE"), "-o", "out.png"],
+      tmp
+    );
+    assert.equal(erRun.status, 1, `build-er が不正な --xml-out を通しました:\n${erRun.stderr}`);
+    assert.ok(!fsSync.existsSync(okJson), "不正な --xml-out があるのに先の --json-out を書いてしまいました");
+    assert.equal(await fs.readFile(noticePath, "utf8"), noticeBody, "NOTICE が改変されています");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: splitPathRoot が Windows の C:/work/out.png・C:\\work・UNC・POSIX バックスラッシュを正しく切り分ける", () => {
+  assert.deepEqual(splitPathRoot("C:/work/out.png", "win32", "D:\\proj"), {
+    isAbs: true,
+    root: "C:\\",
+    baseDir: "D:\\proj",
+    rest: "work/out.png",
+  });
+  assert.deepEqual(splitPathRoot("c:\\work\\out.png", "win32", "D:\\proj"), {
+    isAbs: true,
+    root: "C:\\",
+    baseDir: "D:\\proj",
+    rest: "work\\out.png",
+  });
+  assert.deepEqual(splitPathRoot("//filesrv/share/a/b.png", "win32", "C:\\proj"), {
+    isAbs: true,
+    root: "\\\\filesrv\\share\\",
+    baseDir: "C:\\proj",
+    rest: "a/b.png",
+  });
+  assert.deepEqual(splitPathRoot("/work/out.png", "win32", "D:\\proj"), {
+    isAbs: true,
+    root: "D:\\",
+    baseDir: "D:\\proj",
+    rest: "work/out.png",
+  });
+  assert.deepEqual(splitPathRoot("sub\\file.png", "linux", "/app"), {
+    isAbs: false,
+    root: "/",
+    baseDir: "/app",
+    rest: "sub\\file.png",
+  });
+});
+
+test("Medium: SNS HTTPS 購読の endpoint=var.* + redrive_policy や EventBridge DLQ で無関係な SQS へ誤結線しない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-tf-redrive-"));
+  const TF = `
+resource "aws_sns_topic" "events" {
+  name = "events"
+}
+
+resource "aws_sqs_queue" "dlq" {
+  name = "events-dlq"
+}
+
+resource "aws_sns_topic_subscription" "webhook" {
+  topic_arn = aws_sns_topic.events.arn
+  protocol  = "https"
+  endpoint  = var.callback_url
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq.arn
+  })
+}
+
+resource "aws_cloudwatch_event_rule" "sched" {
+  name                = "sched"
+  schedule_expression = "rate(1 hour)"
+}
+
+resource "aws_cloudwatch_event_target" "ext" {
+  rule = aws_cloudwatch_event_rule.sched.name
+  arn  = var.external_target_arn
+  dead_letter_config {
+    arn = aws_sqs_queue.dlq.arn
+  }
+}
+`;
+  try {
+    await fs.writeFile(path.join(tmp, "main.tf"), TF, "utf8");
+    const spec = await scanTerraformDirectory(tmp, {});
+    assert.equal(
+      spec.edges.length,
+      0,
+      `redrive_policy / dead_letter_config の DLQ へ誤った辺が張られています: ${JSON.stringify(spec.edges)}`
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium / Low: drawio2png --all-pages はページ出力同士の symlink 衝突を書き込み前に拒否する", async (t) => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-allpages-"));
+  try {
+    const multiXml =
+      '<mxfile>' +
+      '<diagram id="p1" name="PageA"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="80" height="40" as="geometry"/></mxCell></root></mxGraphModel></diagram>' +
+      '<diagram id="p2" name="PageB"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="b" value="B" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="80" height="40" as="geometry"/></mxCell></root></mxGraphModel></diagram>' +
+      '</mxfile>';
+    const inXml = path.join(tmp, "multi.drawio");
+    const page1Out = path.join(tmp, "out-1-PageA.png");
+    const page2Out = path.join(tmp, "out-2-PageB.png");
+    const sentinel = Buffer.from("SENTINEL-PAGE-BYTES");
+    await fs.writeFile(inXml, multiXml, "utf8");
+    await fs.writeFile(page1Out, sentinel);
+    const linked = await trySymlink("out-1-PageA.png", page2Out);
+    if (!linked) {
+      t.skip("symlink を作成できない環境のためスキップ");
+      return;
+    }
+
+    const res = runScript("drawio2png.mjs", ["multi.drawio", "--all-pages", "-o", "out.png"], tmp);
+    assert.equal(res.status, 1, `--all-pages 出力衝突が exit(1) になりません:\n${res.stdout}\n${res.stderr}`);
+    assert.match(res.stderr, /衝突/, `衝突理由が出力されていません: ${res.stderr}`);
+    assert.ok((await fs.readFile(page1Out)).equals(sentinel), "ページ 1 の既存ファイルが上書きされました");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: drawio2png --all-pages はページ 1 未作成時の dangling symlink (ページ2 -> ページ1) も事前検知する", async (t) => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-allpages-dangling-"));
+  try {
+    const multiXml =
+      '<mxfile>' +
+      '<diagram id="p1" name="PageA"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" value="A" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="80" height="40" as="geometry"/></mxCell></root></mxGraphModel></diagram>' +
+      '<diagram id="p2" name="PageB"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="b" value="B" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="80" height="40" as="geometry"/></mxCell></root></mxGraphModel></diagram>' +
+      '</mxfile>';
+    await fs.writeFile(path.join(tmp, "multi.drawio"), multiXml, "utf8");
+    const page1Out = path.join(tmp, "out-1-PageA.png");
+    const page2Out = path.join(tmp, "out-2-PageB.png");
+    // ページ 1 のファイルはまだ存在しない状態で、ページ 2 だけを page 1 への dangling symlink にしておく
+    const linked = await trySymlink("out-1-PageA.png", page2Out);
+    if (!linked) {
+      t.skip("symlink を作成できない環境のためスキップ");
+      return;
+    }
+
+    const res = runScript("drawio2png.mjs", ["multi.drawio", "--all-pages", "-o", "out.png"], tmp);
+    assert.equal(res.status, 1, `dangling symlink 衝突が exit(1) になりません:\n${res.stdout}\n${res.stderr}`);
+    assert.match(res.stderr, /衝突/, `衝突理由が出力されていません: ${res.stderr}`);
+    assert.ok(!fsSync.existsSync(page1Out), "事前検知で止まらずページ 1 を作ってしまいました");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: emitDiagramFiles は画像側の一時ファイル作成失敗時に既存 XML を無傷のまま保ち一時ファイルを残さない", async (t) => {
+  if (process.platform === "win32" || (typeof process.getuid === "function" && process.getuid() === 0)) {
+    t.skip("Windows または root 環境ではディレクトリ 0555 による書き込み拒否が成立しないためスキップ");
+    return;
+  }
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-pair-atomic-"));
+  const xmlDir = path.join(tmp, "xml");
+  const pngDir = path.join(tmp, "png");
+  try {
+    await fs.mkdir(xmlDir, { recursive: true });
+    await fs.mkdir(pngDir, { recursive: true });
+    const xmlPath = path.join(xmlDir, "out.drawio");
+    const pngPath = path.join(pngDir, "out.png");
+    const sentinelXml = "<mxfile>SENTINEL</mxfile>";
+    await fs.writeFile(xmlPath, sentinelXml, "utf8");
+    await fs.chmod(pngDir, 0o555);
+
+    let errCaught = null;
+    await assert.rejects(
+      () =>
+        emitDiagramFiles({
+          xml: "<mxfile>NEW</mxfile>",
+          outPath: pngPath,
+          xmlOutPath: xmlPath,
+          convertPng: () => ({ png: Buffer.from("PNG"), width: 10, height: 10 }),
+          convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+        }),
+      (err) => {
+        errCaught = err;
+        return Boolean(err);
+      }
+    );
+    // 排他ロック（/tmp 配下）を通過し、実際に pngDir への stageTempFile で失敗したことを確認する
+    assert.ok(
+      String(errCaught?.path || "").includes(".drawio.tmp-"),
+      `stageTempFile ではなくロック等で先に失敗しました: ${errCaught?.code} ${errCaught?.path} ${errCaught?.message}`
+    );
+
+    assert.equal(await fs.readFile(xmlPath, "utf8"), sentinelXml, "画像書込失敗時に XML だけが更新されました");
+    assert.deepEqual(await fs.readdir(xmlDir), ["out.drawio"], "XML 側に一時ファイルが残っています");
+    assert.deepEqual(await fs.readdir(pngDir), [], "画像側に一時ファイルが残っています");
+  } finally {
+    await fs.chmod(pngDir, 0o755).catch(() => {});
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: emitDiagramFiles の同一出力先への並行実行でも XML と画像の世代が混在しない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-pair-concurrent-"));
+  try {
+    const xmlPath = path.join(tmp, "out.drawio");
+    const pngPath = path.join(tmp, "out.png");
+    const big = "X".repeat(128 * 1024);
+    for (let round = 0; round < 10; round += 1) {
+      await Promise.all([
+        emitDiagramFiles({
+          xml: `<mxfile gen="A-${round}">${big}</mxfile>`,
+          outPath: pngPath,
+          xmlOutPath: xmlPath,
+          convertPng: () => ({ png: Buffer.from(`PNG:A-${round}:${big}`), width: 10, height: 10 }),
+          convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+        }),
+        emitDiagramFiles({
+          xml: `<mxfile gen="B-${round}"/>`,
+          outPath: pngPath,
+          xmlOutPath: xmlPath,
+          convertPng: () => ({ png: Buffer.from(`PNG:B-${round}`), width: 10, height: 10 }),
+          convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+        }),
+      ]);
+      const finalXml = await fs.readFile(xmlPath, "utf8");
+      const finalPng = await fs.readFile(pngPath, "utf8");
+      const xmlGen = finalXml.match(/gen="([AB]-\d+)"/)?.[1];
+      const pngGen = finalPng.match(/^PNG:([AB]-\d+)/)?.[1];
+      assert.ok(xmlGen && pngGen, `世代ラベルが欠落: ${finalXml.slice(0, 40)} / ${finalPng.slice(0, 40)}`);
+      assert.equal(xmlGen, pngGen, `round ${round}: XML (${xmlGen}) と画像 (${pngGen}) の世代が混在しました`);
+    }
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: POSIX で既存 0600 ファイルを writeFileAtomic / emitDiagramFiles で更新しても 0600 のまま維持する", async () => {
+  if (process.platform === "win32") return;
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-mode-"));
+  try {
+    const secretJson = path.join(tmp, "secret.json");
+    const secretXml = path.join(tmp, "secret.drawio");
+    const secretPng = path.join(tmp, "secret.png");
+    await fs.writeFile(secretJson, "{}\n", { mode: 0o600 });
+    await fs.chmod(secretJson, 0o600);
+    await fs.writeFile(secretXml, "<old/>", { mode: 0o600 });
+    await fs.chmod(secretXml, 0o600);
+    await fs.writeFile(secretPng, Buffer.from("OLD"), { mode: 0o600 });
+    await fs.chmod(secretPng, 0o600);
+
+    await writeFileAtomic(secretJson, '{"updated":true}\n');
+    await emitDiagramFiles({
+      xml: "<new/>",
+      outPath: secretPng,
+      xmlOutPath: secretXml,
+      convertPng: () => ({ png: Buffer.from("NEWPNG"), width: 10, height: 10 }),
+      convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+    });
+
+    assert.equal((await fs.stat(secretJson)).mode & 0o777, 0o600, "writeFileAtomic で 0600 権限が広がりました");
+    assert.equal((await fs.stat(secretXml)).mode & 0o777, 0o600, "emitDiagramFiles (XML) で 0600 権限が広がりました");
+    assert.equal((await fs.stat(secretPng)).mode & 0o777, 0o600, "emitDiagramFiles (PNG) で 0600 権限が広がりました");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: base.mts とコンパイル済み base.mjs が同居しても ./base.mjs は TypeScript 側 base.mts を優先する", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-ext-prio-"));
+  try {
+    // base.mjs は辞書順で base.mts より先に来るが、TS ソースの base.mts が優先されなければならない
+    await fs.writeFile(
+      path.join(tmp, "base.mjs"),
+      "export default class CompiledJsBase { compiled: boolean = true; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "base.mts"),
+      "export default class TsSourceBase { tsSource: boolean = true; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "child.mts"),
+      'import Base from "./base.mjs";\nexport class MtsChild extends Base {}\n',
+      "utf8"
+    );
+    // 通常の base.ts + コンパイル済み base.js でも `./base.js` は base.ts を優先する
+    await fs.writeFile(
+      path.join(tmp, "norm.js"),
+      "export class CompiledNormalBase {}\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "norm.ts"),
+      "export class TsNormalBase {}\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "norm-child.ts"),
+      'import { TsNormalBase } from "./norm.js";\nexport class NormChild extends TsNormalBase {}\n',
+      "utf8"
+    );
+
+    const spec = await scanDirectory(tmp, {});
+    const mtsChild = spec.classes.find((c) => c.name === "MtsChild");
+    const rel = spec.relations.find((r) => r.from === mtsChild.id && r.type === "inheritance");
+    assert.ok(rel, `inheritance がありません: ${JSON.stringify(spec.relations)}`);
+    assert.equal(spec.classes.find((c) => c.id === rel.to).name, "TsSourceBase");
+
+    const normChild = spec.classes.find((c) => c.name === "NormChild");
+    const normRel = spec.relations.find((r) => r.from === normChild.id && r.type === "inheritance");
+    assert.ok(normRel);
+    assert.equal(spec.classes.find((c) => c.id === normRel.to).name, "TsNormalBase");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: default 再エクスポート解決失敗時に中継モジュールの単一ローカル型へ誤結線せず、有効な再エクスポート先は辿る", async () => {
+  const tmp1 = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-barrel-1-"));
+  const tmp2 = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-barrel-2-"));
+  try {
+    // ケース 1: b.ts に UnrelatedLocal が 1 つだけあり、default re-export 先が未解決（./missing）
+    await fs.writeFile(
+      path.join(tmp1, "b.ts"),
+      'class UnrelatedLocal {}\nexport { Missing as default } from "./missing";\n',
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp1, "c.ts"),
+      'import Parent from "./b";\nexport class Child extends Parent {}\n',
+      "utf8"
+    );
+    const spec1 = await scanDirectory(tmp1, {});
+    assert.equal(
+      spec1.relations.filter((r) => r.from === "Child").length,
+      0,
+      `未解決の default re-export なのに中継側の単一ローカル型へ誤結線しました: ${JSON.stringify(spec1.relations)}`
+    );
+
+    // ケース 2: a.ts の RealBase を b.ts が `export { RealBase as default } from "./a"` で再公開し、b.ts には UnrelatedLocal がある
+    await fs.writeFile(
+      path.join(tmp2, "a.ts"),
+      "export class RealBase { ok: boolean = true; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp2, "b.ts"),
+      'class UnrelatedLocal {}\nexport { RealBase as default } from "./a";\n',
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp2, "c.ts"),
+      'import Parent from "./b";\nexport class Child extends Parent {}\n',
+      "utf8"
+    );
+    const spec2 = await scanDirectory(tmp2, {});
+    const rel2 = spec2.relations.find((r) => r.from === "Child" && r.type === "inheritance");
+    assert.ok(rel2, `default re-export チェーンが解決されません: ${JSON.stringify(spec2.relations)}`);
+    assert.equal(spec2.classes.find((c) => c.id === rel2.to).name, "RealBase");
+  } finally {
+    await fs.rm(tmp1, { recursive: true, force: true });
+    await fs.rm(tmp2, { recursive: true, force: true });
+  }
+});
+
+test("Medium: scan-classes / build-class は絶対パスの --src-dir を title / subtitle / JSON に生出ししない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-class-safedir-"));
+  const srcDir = path.join(tmp, "my-domain");
+  const outXml = path.join(tmp, "out.drawio");
+  const outPng = path.join(tmp, "out.drawio.png");
+  try {
+    await fs.mkdir(srcDir, { recursive: true });
+    await fs.writeFile(path.join(srcDir, "Order.ts"), "export class Order { id: string = ''; }\n", "utf8");
+
+    const spec = await scanDirectory(srcDir, {});
+    assert.ok(!spec.subtitle.includes(srcDir), `subtitle に絶対パスが含まれています: ${spec.subtitle}`);
+    assert.ok(!spec.subtitle.includes(os.tmpdir()), `subtitle に tmpdir 絶対パスが含まれています: ${spec.subtitle}`);
+    assert.ok(spec.subtitle.includes("my-domain"), `subtitle に末尾ディレクトリ名がありません: ${spec.subtitle}`);
+
+    const r = runScript("build-class.mjs", ["--src-dir", srcDir, "--no-png", "--xml-out", outXml, "-o", outPng], tmp);
+    assert.equal(r.status, 0, `build-class 失敗:\n${r.stdout}\n${r.stderr}`);
+    const xml = await fs.readFile(outXml, "utf8");
+    assert.ok(!xml.includes(srcDir), `生成 XML のタイトル等に絶対パスが含まれています`);
+    assert.ok(xml.includes("Class diagram (my-domain)"), "生成 XML に安全な短縮タイトルがありません");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: 別々の CLI プロセスが同じ出力先へ emitDiagramFiles を並行実行しても XML と画像の世代が混在せず lockfile も残らない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-xproc-lock-"));
+  try {
+    const sharedUrl = pathToFileURL(path.join(ROOT, "scripts", "diagram-shared.mjs")).href;
+    const xmlPath = path.join(tmp, "out.drawio");
+    const pngPath = path.join(tmp, "out.png");
+    const workerCode = `
+      import { emitDiagramFiles } from ${JSON.stringify(sharedUrl)};
+      const gen = process.env.WORKER_GEN;
+      const rounds = Number(process.env.WORKER_ROUNDS || "5");
+      const pad = "Z".repeat(gen === "A" ? 256 * 1024 : 32);
+      for (let i = 0; i < rounds; i += 1) {
+        const tag = gen + "-" + i;
+        await emitDiagramFiles({
+          xml: '<mxfile gen="' + tag + '">' + pad + '</mxfile>',
+          outPath: process.env.OUT_PNG,
+          xmlOutPath: process.env.OUT_XML,
+          convertPng: () => ({ png: Buffer.from("PNG:" + tag + ":" + pad), width: 10, height: 10 }),
+          convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+        });
+      }
+    `;
+    const runWorker = (gen) =>
+      new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          ["--input-type=module", "-e", workerCode],
+          {
+            cwd: tmp,
+            env: { ...process.env, WORKER_GEN: gen, WORKER_ROUNDS: "6", OUT_XML: xmlPath, OUT_PNG: pngPath },
+            stdio: ["ignore", "pipe", "pipe"],
+          }
+        );
+        let stderr = "";
+        child.stderr.on("data", (d) => {
+          stderr += d.toString();
+        });
+        child.on("error", reject);
+        child.on("close", (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`worker ${gen} exited ${code}: ${stderr}`));
+        });
+      });
+
+    await Promise.all([runWorker("A"), runWorker("B")]);
+
+    const finalXml = await fs.readFile(xmlPath, "utf8");
+    const finalPng = await fs.readFile(pngPath, "utf8");
+    const xmlGen = finalXml.match(/gen="([AB]-\d+)"/)?.[1];
+    const pngGen = finalPng.match(/^PNG:([AB]-\d+):/)?.[1];
+    assert.ok(xmlGen && pngGen, "最終出力に世代タグがありません");
+    assert.equal(xmlGen, pngGen, `プロセス間並行実行で XML (${xmlGen}) と PNG (${pngGen}) の世代が混在しました`);
+    assert.deepEqual(
+      (await fs.readdir(tmp)).sort(),
+      ["out.drawio", "out.png"],
+      "完了後に lockfile や一時ファイルが残っています"
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: export { default } from './a' で default 未定義の単一名前付きクラスへ誤結線しない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-reexp-nodef-"));
+  try {
+    await fs.writeFile(
+      path.join(tmp, "a.ts"),
+      "export class OnlyNamed { x: number = 1; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "b.ts"),
+      'export { default } from "./a";\n',
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "c.ts"),
+      'import Parent from "./b";\nexport class Child extends Parent {}\n',
+      "utf8"
+    );
+    const spec = await scanDirectory(tmp, {});
+    assert.equal(
+      spec.relations.filter((r) => r.from === "Child").length,
+      0,
+      `default 未定義のモジュールから誤った継承線が生成されました: ${JSON.stringify(spec.relations)}`
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: export { Actual as Base } と export { Base as default } from './a' の別名再エクスポートを追跡できる", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-alias-reexp-"));
+  try {
+    await fs.writeFile(
+      path.join(tmp, "a.ts"),
+      "class Actual { ok: boolean = true; }\nexport { Actual as Base };\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "b.ts"),
+      'export { Base as default } from "./a";\n',
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "c.ts"),
+      'import Parent from "./b";\nexport class Child extends Parent {}\n',
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "d.ts"),
+      'import { Base } from "./a";\nexport class DirectChild extends Base {}\n',
+      "utf8"
+    );
+    const spec = await scanDirectory(tmp, {});
+    const relC = spec.relations.find((r) => r.from === "Child" && r.type === "inheritance");
+    const relD = spec.relations.find((r) => r.from === "DirectChild" && r.type === "inheritance");
+    assert.ok(relC, `export { Actual as Base } -> export { Base as default } が欠落しています: ${JSON.stringify(spec.relations)}`);
+    assert.ok(relD, `import { Base } from ./a (export { Actual as Base }) が欠落しています: ${JSON.stringify(spec.relations)}`);
+    assert.equal(spec.classes.find((c) => c.id === relC.to).name, "Actual");
+    assert.equal(spec.classes.find((c) => c.id === relD.to).name, "Actual");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: FIFO やデバイスなど特殊ファイルを出力先に指定したら上書きも読み取り待ちもせず拒否する", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows では POSIX FIFO がないためスキップ");
+    return;
+  }
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-fifo-"));
+  let child = null;
+  try {
+    const fifoPath = path.join(tmp, "out.fifo");
+    const mk = spawnSync("mkfifo", [fifoPath], { encoding: "utf8" });
+    if (mk.status !== 0) {
+      t.skip("mkfifo を作成できない環境のためスキップ");
+      return;
+    }
+
+    assert.throws(() => resolveWriteTarget(fifoPath), { code: "EINVAL" });
+
+    const outPng = path.join(tmp, "out.png");
+    const sharedUrl = pathToFileURL(path.join(ROOT, "scripts/diagram-shared.mjs")).href;
+    const fifoScript = `
+      const { writeFileAtomic, emitDiagramFiles } = await import(process.argv[1]);
+      let code1 = "";
+      try {
+        await writeFileAtomic(process.argv[2], "OVERWRITE");
+        code1 = "UNEXPECTED_OK";
+      } catch (err) {
+        code1 = err && err.code ? err.code : String(err);
+      }
+      let code2 = "";
+      try {
+        await emitDiagramFiles({
+          xml: process.argv[4],
+          outPath: process.argv[3],
+          xmlOutPath: process.argv[2],
+          convertPng: () => ({ png: Buffer.from("PNG"), width: 10, height: 10 }),
+          convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+        });
+        code2 = "UNEXPECTED_OK";
+      } catch (err) {
+        code2 = err && err.code ? err.code : String(err);
+      }
+      process.stdout.write(JSON.stringify({ code1, code2 }) + "\\n");
+    `;
+
+    let timedOut = false;
+    child = spawn(
+      process.execPath,
+      ["--input-type=module", "-e", fifoScript, sharedUrl, fifoPath, outPng, MINIMAL_DRAWIO],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+    let out = "";
+    let errOut = "";
+    child.stdout.on("data", (d) => {
+      out += d.toString();
+    });
+    child.stderr.on("data", (d) => {
+      errOut += d.toString();
+    });
+
+    const exitCode = await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, 3000);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve(code);
+      });
+    });
+
+    assert.equal(timedOut, false, `XML/atomic FIFO テストがタイムアウト強制終了しました (${out} / ${errOut})`);
+    assert.equal(exitCode, 0, `子プロセスが異常終了しました: code=${exitCode} err=${errOut}`);
+    const parsed = JSON.parse(out.trim());
+    assert.equal(parsed.code1, "EINVAL", "writeFileAtomic(fifo) が EINVAL ではありません");
+    assert.equal(parsed.code2, "EINVAL", "emitDiagramFiles(xmlOut=fifo) が EINVAL ではありません");
+    assert.ok(fsSync.lstatSync(fifoPath).isFIFO(), "writeFileAtomic / emitDiagramFiles で FIFO が置換されました");
+    assert.ok(!fsSync.existsSync(outPng), "FIFO エラー前に PNG が書かれました");
+
+    const inXml = path.join(tmp, "in.drawio");
+    await fs.writeFile(inXml, MINIMAL_DRAWIO, "utf8");
+    const r = spawnSync(
+      process.execPath,
+      [path.join(ROOT, "scripts/drawio2png.mjs"), "in.drawio", "-o", "out.fifo"],
+      { cwd: tmp, encoding: "utf8", timeout: 5000 }
+    );
+    assert.equal(r.signal, null, `drawio2png -o out.fifo がタイムアウト/シグナル終了しました: ${r.signal}`);
+    assert.equal(r.status, 1, `drawio2png -o out.fifo が exit(1) になりません:\n${r.stderr}`);
+    assert.ok(fsSync.lstatSync(fifoPath).isFIFO(), "drawio2png で FIFO が通常ファイルに置換されました");
+  } finally {
+    if (child) child.kill("SIGKILL");
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: 未作成の --json-out result と --xml-out result/out.drawio のような出力先親子衝突を 1 バイトも書かずに拒否する", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-ancestor-out-"));
+  try {
+    assert.throws(
+      () =>
+        assertDistinctPaths([
+          { role: "--xml-out", value: path.join(tmp, "res") },
+          { role: "--output", value: path.join(tmp, "res", "out.png") },
+        ]),
+      /親子パスで衝突/
+    );
+
+    const sql = path.join(tmp, "schema.sql");
+    await fs.writeFile(sql, "CREATE TABLE t (id INTEGER PRIMARY KEY);\n", "utf8");
+
+    for (const args of [
+      ["--schema", sql, "--json-out", "result", "--xml-out", rawJoin("result", "out.drawio"), "-o", rawJoin("result", "out.png")],
+      ["--schema", sql, "--xml-out", rawJoin("result", "out.drawio"), "-o", rawJoin("result", "out.png"), "--json-out", "result"],
+    ]) {
+      const r = runScript("build-er.mjs", args, tmp);
+      assert.equal(r.status, 1, `親子出力衝突 (${args.join(" ")}) が exit(1) になりません:\n${r.stderr}`);
+      assert.match(r.stderr, /親子パスで衝突/, `衝突理由が出力されていません: ${r.stderr}`);
+      assert.ok(!fsSync.existsSync(path.join(tmp, "result")), "衝突時に result が一部作成されました");
+    }
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("High: 出力ディレクトリの既存 .drawio-lock ファイルや --xml-out .out.png.drawio-lock をロック機構で削除・破壊しない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-lock-clash-"));
+  try {
+    const decoyLock = path.join(tmp, ".out.png.drawio-lock");
+    const decoyBody = "USER IMPORTANT FILE DO NOT DELETE\n";
+    await fs.writeFile(decoyLock, decoyBody, "utf8");
+    const oldTime = new Date(Date.now() - 180 * 1000);
+    await fs.utimes(decoyLock, oldTime, oldTime);
+
+    const outXml = path.join(tmp, "out.drawio");
+    const outPng = path.join(tmp, "out.png");
+    await emitDiagramFiles({
+      xml: "<mxfile>OK</mxfile>",
+      outPath: outPng,
+      xmlOutPath: outXml,
+      convertPng: () => ({ png: Buffer.from("PNG"), width: 10, height: 10 }),
+      convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+    });
+    assert.equal(await fs.readFile(decoyLock, "utf8"), decoyBody, "既存の .out.png.drawio-lock が破壊／削除されました");
+
+    // --xml-out に直接 .out.png.drawio-lock を指定しても、完了後に消されない
+    await emitDiagramFiles({
+      xml: "<mxfile>AS-XML-OUT</mxfile>",
+      outPath: outPng,
+      xmlOutPath: decoyLock,
+      convertPng: () => ({ png: Buffer.from("PNG2"), width: 10, height: 10 }),
+      convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+    });
+    assert.equal(await fs.readFile(decoyLock, "utf8"), "<mxfile>AS-XML-OUT</mxfile>");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: 死亡 PID の古いロックは回収でき、生存 PID の古いロックは 60 秒経過しても奪取しない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-lock-liveness-"));
+  try {
+    const targetPng = path.join(tmp, "out.png");
+    const { lockPath } = await getTargetLockPaths(targetPng);
+
+    // 1) 確実に終了済みの子プロセス PID で古いロックを置き、安全に回収して書き込めることを確かめる
+    const deadChild = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    await new Promise((res) => deadChild.on("close", res));
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({ magic: "drawio-diagrams-lock-v1", pid: deadChild.pid, nonce: "dead", createdAt: Date.now() - 120000 }),
+      { mode: 0o600 }
+    );
+    const oldTime = new Date(Date.now() - 120000);
+    await fs.utimes(lockPath, oldTime, oldTime);
+
+    await emitDiagramFiles({
+      xml: "<mxfile/>",
+      outPath: targetPng,
+      convertPng: () => ({ png: Buffer.from("RECLAIMED"), width: 10, height: 10 }),
+      convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+    });
+    assert.equal(await fs.readFile(targetPng, "utf8"), "RECLAIMED");
+    assert.ok(!fsSync.existsSync(lockPath), "回収後のロックが解放されていません");
+
+    // 2) 生存中の別プロセスが 120 秒前の mtime でロックを持っているとき、奪取しない
+    const sleeper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000);"], { stdio: "ignore" });
+    try {
+      await fs.writeFile(
+        lockPath,
+        JSON.stringify({ magic: "drawio-diagrams-lock-v1", pid: sleeper.pid, nonce: "alive", createdAt: Date.now() - 120000 }),
+        { mode: 0o600 }
+      );
+      await fs.utimes(lockPath, oldTime, oldTime);
+      // 同一プロセス内の他出力とは無関係なのでタイムアウトテストは行わず、生存ロックのまま別ファイルには影響しないことと、
+      // 実際に同一パスなら解放（sleeper 終了）後にすぐ取れることを確認する
+      let done = false;
+      const pending = emitDiagramFiles({
+        xml: "<mxfile/>",
+        outPath: targetPng,
+        convertPng: () => ({ png: Buffer.from("AFTER-SLEEPER"), width: 10, height: 10 }),
+        convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+      }).then(() => {
+        done = true;
+      });
+      await new Promise((r) => setTimeout(r, 120));
+      assert.equal(done, false, "生存中の PID が持つ 120 秒前のロックを奪取してしまいました");
+      sleeper.kill("SIGKILL");
+      await new Promise((res) => sleeper.on("close", res));
+      await pending;
+      assert.equal(await fs.readFile(targetPng, "utf8"), "AFTER-SLEEPER");
+    } finally {
+      sleeper.kill("SIGKILL");
+      await fs.rm(lockPath, { force: true }).catch(() => {});
+    }
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: export { Actual as Base } from './a' と非公開の class Base が共存しても非公開クラスへ誤結線しない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-reexp-shadow-"));
+  try {
+    await fs.writeFile(
+      path.join(tmp, "a.ts"),
+      "export class Actual { fromA: boolean = true; }\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "b.ts"),
+      'class Base { privateLocal: boolean = true; }\nexport { Actual as Base } from "./a";\n',
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "c.ts"),
+      'import { Base } from "./b";\nexport class Child extends Base {}\n',
+      "utf8"
+    );
+    const spec = await scanDirectory(tmp, {});
+    const rel = spec.relations.find((r) => r.from === "Child" && r.type === "inheritance");
+    assert.ok(rel, `inheritance がありません: ${JSON.stringify(spec.relations)}`);
+    assert.equal(
+      spec.classes.find((c) => c.id === rel.to).name,
+      "Actual",
+      "非公開 class Base へ誤結線しました"
+    );
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: import { Actual } from './a'; export { Actual as default } / export default Actual を解決する", async () => {
+  const tmp1 = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-imp-def-1-"));
+  const tmp2 = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-imp-def-2-"));
+  try {
+    await fs.writeFile(path.join(tmp1, "a.ts"), "export class Actual { v: number = 1; }\n", "utf8");
+    await fs.writeFile(
+      path.join(tmp1, "b.ts"),
+      'import { Actual } from "./a";\nexport { Actual as default };\n',
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp1, "c.ts"),
+      'import Parent from "./b";\nexport class Child extends Parent {}\n',
+      "utf8"
+    );
+    const spec1 = await scanDirectory(tmp1, {});
+    const rel1 = spec1.relations.find((r) => r.from === "Child" && r.type === "inheritance");
+    assert.ok(rel1, `export { Actual as default } が解決できません: ${JSON.stringify(spec1.relations)}`);
+    assert.equal(spec1.classes.find((c) => c.id === rel1.to).name, "Actual");
+
+    await fs.writeFile(path.join(tmp2, "a.ts"), "export class Actual { v: number = 2; }\n", "utf8");
+    await fs.writeFile(
+      path.join(tmp2, "b.ts"),
+      'import { Actual } from "./a";\nexport default Actual;\n',
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp2, "c.ts"),
+      'import Parent from "./b";\nexport class Child extends Parent {}\n',
+      "utf8"
+    );
+    const spec2 = await scanDirectory(tmp2, {});
+    const rel2 = spec2.relations.find((r) => r.from === "Child" && r.type === "inheritance");
+    assert.ok(rel2, `export default Actual が解決できません: ${JSON.stringify(spec2.relations)}`);
+    assert.equal(spec2.classes.find((c) => c.id === rel2.to).name, "Actual");
+  } finally {
+    await fs.rm(tmp1, { recursive: true, force: true });
+    await fs.rm(tmp2, { recursive: true, force: true });
+  }
+});
+
+
+test("Medium: ensureLockDir は既存の 0777/0755 ディレクトリを EACCES で拒否し、作成不可時もフェイルクローズして新規作成時は 0700 を保証する", async (t) => {
+  if (process.platform === "win32" || (typeof process.getuid === "function" && process.getuid() === 0)) {
+    t.skip("POSIX 非 root のみ権限ビット検証を実施");
+    return;
+  }
+  const tmpBad = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-lockdir-bad-"));
+  const tmpFresh = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-lockdir-fresh-"));
+  const tmpRo = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-lockdir-ro-"));
+  try {
+    const uidPart = `u${process.getuid()}`;
+    const badDir = path.join(tmpBad, `drawio-diagrams-locks-${uidPart}`);
+    await fs.mkdir(badDir, { mode: 0o777 });
+    await fs.chmod(badDir, 0o777);
+    await assert.rejects(
+      () => ensureLockDir(tmpBad),
+      (err) => err && err.code === "EACCES"
+    );
+
+    await fs.chmod(badDir, 0o755);
+    await assert.rejects(
+      () => ensureLockDir(tmpBad),
+      (err) => err && err.code === "EACCES"
+    );
+
+    await fs.chmod(tmpRo, 0o555);
+    await assert.rejects(
+      () => ensureLockDir(tmpRo),
+      (err) => err && err.code === "EACCES"
+    );
+
+    const freshDir = await ensureLockDir(tmpFresh);
+    const st = await fs.lstat(freshDir);
+    assert.equal(st.mode & 0o777, 0o700, "新規作成ロックディレクトリの権限が 0700 ではありません");
+  } finally {
+    await fs.chmod(tmpRo, 0o700).catch(() => {});
+    await fs.rm(tmpBad, { recursive: true, force: true });
+    await fs.rm(tmpFresh, { recursive: true, force: true });
+    await fs.rm(tmpRo, { recursive: true, force: true });
+  }
+});
+
+test("Medium: 死亡 PID の .reclaim スロットを削除せず deadTag+k ラダーで次スロットへ進み原子的に回収する", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-reclaim-ladder-"));
+  const dead1 = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  const dead2 = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await Promise.all([
+    new Promise((res) => dead1.on("close", res)),
+    new Promise((res) => dead2.on("close", res)),
+  ]);
+  const sleeper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000);"], { stdio: "ignore" });
+
+  let lockPath;
+  let slot0;
+  let slot1;
+  try {
+    const targetPng = path.join(tmp, "out.png");
+    const paths = await getTargetLockPaths(targetPng);
+    lockPath = paths.lockPath;
+    const { lockDir, hash } = paths;
+
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        magic: "drawio-diagrams-lock-v1",
+        pid: dead1.pid,
+        nonce: "deadnonce1",
+        createdAt: Date.now() - 1000,
+      }),
+      { mode: 0o600 }
+    );
+    const lst = await fs.lstat(lockPath);
+    const deadTag = `${lst.dev}_${lst.ino}_deadnonce1`;
+    slot0 = path.join(lockDir, `${hash}.reclaim-${deadTag}-0`);
+    slot1 = path.join(lockDir, `${hash}.reclaim-${deadTag}-1`);
+
+    await fs.writeFile(
+      slot0,
+      JSON.stringify({
+        magic: "drawio-diagrams-reclaim-v1",
+        pid: dead2.pid,
+        nonce: "deadslot0",
+        deadTag,
+        slot: 0,
+        createdAt: Date.now(),
+      }),
+      { mode: 0o600 }
+    );
+    await fs.writeFile(
+      slot1,
+      JSON.stringify({
+        magic: "drawio-diagrams-reclaim-v1",
+        pid: sleeper.pid,
+        nonce: "aliveslot1",
+        deadTag,
+        slot: 1,
+        createdAt: Date.now(),
+      }),
+      { mode: 0o600 }
+    );
+
+    let done = false;
+    const pending = emitDiagramFiles({
+      xml: "<mxfile/>",
+      outPath: targetPng,
+      convertPng: () => ({ png: Buffer.from("LADDER-OK"), width: 10, height: 10 }),
+      convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+    }).then(() => {
+      done = true;
+    });
+
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(done, false, "生存中のスロット1を無視して先へ進んでしまいました");
+    assert.equal(fsSync.existsSync(slot0), true, "死亡スロット0を奪取前に削除してしまいました");
+    assert.equal(fsSync.existsSync(slot1), true, "生存スロット1を奪取前に削除してしまいました");
+
+    sleeper.kill("SIGKILL");
+    await new Promise((res) => sleeper.on("close", res));
+
+    await pending;
+    assert.equal(await fs.readFile(targetPng, "utf8"), "LADDER-OK");
+    assert.equal(fsSync.existsSync(lockPath), false, "回収後の本体ロックが解放されていません");
+    assert.equal(fsSync.existsSync(slot0), false, "回収完了後に slot0 が残っています");
+    assert.equal(fsSync.existsSync(slot1), false, "回収完了後に slot1 が残っています");
+  } finally {
+    sleeper.kill("SIGKILL");
+    if (slot0) await fs.rm(slot0, { force: true }).catch(() => {});
+    if (slot1) await fs.rm(slot1, { force: true }).catch(() => {});
+    if (lockPath) await fs.rm(lockPath, { force: true }).catch(() => {});
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: POSIX で TMPDIR 環境変数が異なる 2 プロセス間でも同一ロックを共有して排他制御する", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX TMPDIR 独立共有ロックテスト");
+    return;
+  }
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-cross-tmpdir-"));
+  const tmpA = path.join(tmp, "tmpA");
+  const tmpB = path.join(tmp, "tmpB");
+  await fs.mkdir(tmpA, { recursive: true });
+  await fs.mkdir(tmpB, { recursive: true });
+  const targetPng = path.join(tmp, "shared.png");
+  const targetXml = path.join(tmp, "shared.drawio");
+  const sharedUrl = pathToFileURL(path.join(ROOT, "scripts/diagram-shared.mjs")).href;
+
+  let lockPathA = null;
+  let childA = null;
+  let childB = null;
+  try {
+    const scriptA = `
+      import fs from "node:fs/promises";
+      const { getTargetLockPaths } = await import(process.argv[1]);
+      const { lockPath } = await getTargetLockPaths(process.argv[2]);
+      await fs.writeFile(
+        lockPath,
+        JSON.stringify({ magic: "drawio-diagrams-lock-v1", pid: process.pid, nonce: "procA", createdAt: Date.now() }),
+        { flag: "wx", mode: 0o600 }
+      );
+      process.stdout.write("READY:" + lockPath + "\\n");
+      process.stdin.resume();
+      const cleanup = async () => {
+        await fs.rm(lockPath, { force: true }).catch(() => {});
+        process.exit(0);
+      };
+      process.stdin.on("end", cleanup);
+      process.on("SIGTERM", cleanup);
+      setTimeout(cleanup, 10000).unref();
+    `;
+    childA = spawn(process.execPath, ["--input-type=module", "-e", scriptA, sharedUrl, targetPng], {
+      env: { ...process.env, TMPDIR: tmpA },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    lockPathA = await new Promise((resolve, reject) => {
+      let buf = "";
+      let errBuf = "";
+      childA.stderr.on("data", (d) => {
+        errBuf += d.toString();
+      });
+      childA.stdout.on("data", (d) => {
+        buf += d.toString();
+        const m = buf.match(/^READY:(.+)\n/m);
+        if (m) resolve(m[1]);
+      });
+      childA.on("close", (code) => {
+        if (!buf.includes("READY:")) reject(new Error(`childA exited early (${code}): ${errBuf}`));
+      });
+    });
+
+    const parentPaths = await getTargetLockPaths(targetPng);
+    assert.equal(lockPathA, parentPaths.lockPath, "TMPDIR が異なるプロセスで lockPath が一致しません");
+    assert.equal(lockPathA.startsWith(tmpA), false, "TMPDIR 配下にロックが分散しています");
+
+    const scriptB = `
+      const { emitDiagramFiles } = await import(process.argv[1]);
+      await emitDiagramFiles({
+        xml: "<mxfile>GEN-B</mxfile>",
+        outPath: process.argv[2],
+        xmlOutPath: process.argv[3],
+        convertPng: () => ({ png: Buffer.from("PNG-B"), width: 10, height: 10 }),
+        convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+      });
+    `;
+    let childBExited = false;
+    childB = spawn(
+      process.execPath,
+      ["--input-type=module", "-e", scriptB, sharedUrl, targetPng, targetXml],
+      {
+        env: { ...process.env, TMPDIR: tmpB },
+        stdio: ["ignore", "pipe", "pipe"],
+      }
+    );
+    let bErr = "";
+    childB.stderr.on("data", (d) => {
+      bErr += d.toString();
+    });
+    const bClosed = new Promise((resolve) => {
+      childB.on("close", (code) => {
+        childBExited = true;
+        resolve(code);
+      });
+    });
+
+    await new Promise((r) => setTimeout(r, 180));
+    assert.equal(childBExited, false, "別 TMPDIR プロセスのロックを無視して書き込みが完了しました");
+    assert.equal(fsSync.existsSync(targetPng), false, "ロック保持中に PNG が書き込まれました");
+
+    childA.stdin.end();
+    await new Promise((res) => childA.on("close", res));
+
+    const codeB = await bClosed;
+    assert.equal(codeB, 0, `childB failed: ${bErr}`);
+    assert.equal(await fs.readFile(targetPng, "utf8"), "PNG-B");
+    assert.equal(await fs.readFile(targetXml, "utf8"), "<mxfile>GEN-B</mxfile>");
+  } finally {
+    if (childA) childA.kill("SIGKILL");
+    if (childB) childB.kill("SIGKILL");
+    if (lockPathA) await fs.rm(lockPathA, { force: true }).catch(() => {});
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: macOS で未作成の Unicode NFC と NFD パス衝突を assertDistinctPaths と build-er CLI で検知する", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("macOS Unicode NFC/NFD 正規化テスト");
+    return;
+  }
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-nfc-nfd-"));
+  try {
+    const nfcPng = path.join(tmp, "review-\u30ac.png");
+    const nfdPng = path.join(tmp, "review-\u30ab\u3099.png");
+    const upperNfdPng = path.join(tmp, "Review-\u30ab\u3099.PNG");
+
+    assert.throws(
+      () =>
+        assertDistinctPaths([
+          { role: "--xml-out", value: nfcPng },
+          { role: "--output", value: nfdPng },
+        ]),
+      /衝突/
+    );
+    assert.throws(
+      () =>
+        assertDistinctPaths([
+          { role: "--xml-out", value: nfcPng },
+          { role: "--output", value: upperNfdPng },
+        ]),
+      /衝突/
+    );
+    assert.throws(
+      () =>
+        assertDistinctPaths([
+          { role: "--json-out", value: path.join(tmp, "dir-\u30ac") },
+          { role: "--output", value: path.join(tmp, "dir-\u30ab\u3099", "er.png") },
+        ]),
+      /親子パスで衝突/
+    );
+
+    const schemaSql = path.join(tmp, "schema.sql");
+    await fs.writeFile(schemaSql, "CREATE TABLE users (id INT PRIMARY KEY);\n", "utf8");
+    const res = spawnSync(
+      process.execPath,
+      [
+        path.join(ROOT, "scripts/build-er.mjs"),
+        "--schema",
+        schemaSql,
+        "--xml-out",
+        nfcPng,
+        "--output",
+        nfdPng,
+      ],
+      { cwd: tmp, encoding: "utf8" }
+    );
+    assert.notEqual(res.status, 0, "未作成 NFC/NFD 出力衝突を CLI が許可してしまいました");
+    assert.match(res.stderr, /衝突/);
+    assert.equal(fsSync.existsSync(nfcPng), false, "衝突時に NFC 出力が作成されました");
+    assert.equal(fsSync.existsSync(nfdPng), false, "衝突時に NFD 出力が作成されました");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: export default Wrong.Sub や Wrong() 等の式で Wrong クラスへ誤結線しない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-def-expr-"));
+  try {
+    for (const dir of ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "s12"]) {
+      await fs.mkdir(path.join(tmp, dir), { recursive: true });
+    }
+    await fs.writeFile(
+      path.join(tmp, "s1/mod.ts"),
+      "export class Wrong { v: number = 1; }\nexport default Wrong.Sub;\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "s1/child.ts"),
+      'import Parent from "./mod";\nexport class Child1 extends Parent {}\n',
+      "utf8"
+    );
+
+    await fs.writeFile(
+      path.join(tmp, "s2/mod.ts"),
+      "export class Wrong { v: number = 2; }\nexport default Wrong();\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "s2/child.ts"),
+      'import Parent from "./mod";\nexport class Child2 extends Parent {}\n',
+      "utf8"
+    );
+
+    await fs.writeFile(
+      path.join(tmp, "s3/mod.ts"),
+      "export class Wrong { v: number = 3; }\nexport default Wrong\n  .Sub;\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "s3/child.ts"),
+      'import Parent from "./mod";\nexport class Child3 extends Parent {}\n',
+      "utf8"
+    );
+
+    await fs.writeFile(
+      path.join(tmp, "s4/mod.ts"),
+      "export class Actual { v: number = 4; }\nexport default Actual as typeof Actual;\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "s4/child.ts"),
+      'import Parent from "./mod";\nexport class Child4 extends Parent {}\n',
+      "utf8"
+    );
+
+    await fs.writeFile(
+      path.join(tmp, "s5/mod.js"),
+      "class Wrong { constructor() { this.v = 5; } }\nmodule.exports = Wrong.Sub;\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "s5/child.ts"),
+      'import Parent from "./mod";\nexport class Child5 extends Parent {}\n',
+      "utf8"
+    );
+
+    await fs.writeFile(
+      path.join(tmp, "s6/mod.ts"),
+      "export class Wrong { v: number = 6; }\nexport default Wrong\n\n  .Sub;\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "s6/child.ts"),
+      'import Parent from "./mod";\nexport class Child6 extends Parent {}\n',
+      "utf8"
+    );
+
+    await fs.writeFile(
+      path.join(tmp, "s7/mod.ts"),
+      "export class Wrong { v: number = 7; }\nexport default Wrong\n/* comment */\n  .Sub;\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "s7/child.ts"),
+      'import Parent from "./mod";\nexport class Child7 extends Parent {}\n',
+      "utf8"
+    );
+
+    await fs.writeFile(
+      path.join(tmp, "s8/mod.js"),
+      "class Wrong { constructor() { this.v = 8; } }\nmodule.exports = Wrong\n\n  .Sub;\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "s8/child.ts"),
+      'import Parent from "./mod";\nexport class Child8 extends Parent {}\n',
+      "utf8"
+    );
+
+    await fs.writeFile(
+      path.join(tmp, "s9/mod.ts"),
+      "export class ActualTwo { v: number = 9; }\nexport default ActualTwo\n\ninterface INext {}\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "s9/child.ts"),
+      'import Parent from "./mod";\nexport class Child9 extends Parent {}\n',
+      "utf8"
+    );
+
+    await fs.writeFile(
+      path.join(tmp, "s10/mod.ts"),
+      "export class Wrong { v: number = 10; }\nexport default Wrong as typeof Wrong && Actual;\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "s10/child.ts"),
+      'import Parent from "./mod";\nexport class Child10 extends Parent {}\n',
+      "utf8"
+    );
+
+    await fs.writeFile(
+      path.join(tmp, "s11/mod.ts"),
+      "export class Wrong { v: number = 11; }\nexport default Wrong as any || Actual;\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "s11/child.ts"),
+      'import Parent from "./mod";\nexport class Child11 extends Parent {}\n',
+      "utf8"
+    );
+
+    await fs.writeFile(
+      path.join(tmp, "s12/mod.ts"),
+      "export class ActualThree { v: number = 12; }\nexport default ActualThree as unknown as ActualThree;\n",
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(tmp, "s12/child.ts"),
+      'import Parent from "./mod";\nexport class Child12 extends Parent {}\n',
+      "utf8"
+    );
+
+    const spec = await scanDirectory(tmp, {});
+    for (const cname of [
+      "Child1",
+      "Child2",
+      "Child3",
+      "Child5",
+      "Child6",
+      "Child7",
+      "Child8",
+      "Child10",
+      "Child11",
+    ]) {
+      const badRel = spec.relations.find((r) => r.from === cname && r.type === "inheritance");
+      assert.equal(badRel, undefined, `${cname} が式ベース default export で誤結線しました: ${JSON.stringify(badRel)}`);
+    }
+    const okRel = spec.relations.find((r) => r.from === "Child4" && r.type === "inheritance");
+    assert.ok(okRel, `export default Actual as ... が解決できません: ${JSON.stringify(spec.relations)}`);
+    assert.equal(spec.classes.find((c) => c.id === okRel.to).name, "Actual");
+
+    const okRel2 = spec.relations.find((r) => r.from === "Child9" && r.type === "inheritance");
+    assert.ok(okRel2, `export default ActualTwo\\n\\ninterface が解決できません: ${JSON.stringify(spec.relations)}`);
+    assert.equal(spec.classes.find((c) => c.id === okRel2.to).name, "ActualTwo");
+
+    const okRel3 = spec.relations.find((r) => r.from === "Child12" && r.type === "inheritance");
+    assert.ok(okRel3, `export default ActualThree as unknown as ... が解決できません: ${JSON.stringify(spec.relations)}`);
+    assert.equal(spec.classes.find((c) => c.id === okRel3.to).name, "ActualThree");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Low: lockPath に FIFO が事前配置されていても別プロセスでハングせず EINVAL で即拒否する", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX FIFO ロックテスト");
+    return;
+  }
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-lock-fifo-"));
+  let lockPath = null;
+  let child = null;
+  try {
+    const targetPng = path.join(tmp, "fifo-out.png");
+    ({ lockPath } = await getTargetLockPaths(targetPng));
+    await fs.rm(lockPath, { force: true });
+    const mk = spawnSync("mkfifo", [lockPath], { encoding: "utf8" });
+    if (mk.error || mk.status !== 0) {
+      t.skip("mkfifo コマンドが利用できないためスキップ");
+      return;
+    }
+
+    const sharedUrl = pathToFileURL(path.join(ROOT, "scripts/diagram-shared.mjs")).href;
+    const script = `
+      const { emitDiagramFiles } = await import(process.argv[1]);
+      try {
+        await emitDiagramFiles({
+          xml: "<mxfile/>",
+          outPath: process.argv[2],
+          convertPng: () => ({ png: Buffer.from("P"), width: 10, height: 10 }),
+          convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+        });
+        process.stdout.write("UNEXPECTED_OK\\n");
+        process.exit(2);
+      } catch (err) {
+        process.stdout.write("ERR:" + (err && err.code ? err.code : String(err)) + "\\n");
+        process.exit(0);
+      }
+    `;
+
+    let timedOut = false;
+    child = spawn(process.execPath, ["--input-type=module", "-e", script, sharedUrl, targetPng], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let errOut = "";
+    child.stdout.on("data", (d) => {
+      out += d.toString();
+    });
+    child.stderr.on("data", (d) => {
+      errOut += d.toString();
+    });
+
+    const exitCode = await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, 3000);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve(code);
+      });
+    });
+
+    assert.equal(timedOut, false, `FIFO でハングしタイムアウト強制終了しました (${out} / ${errOut})`);
+    assert.equal(exitCode, 0, `子プロセスが異常終了しました: code=${exitCode} out=${out} err=${errOut}`);
+    assert.equal(out.trim(), "ERR:EINVAL");
+  } finally {
+    if (child) child.kill("SIGKILL");
+    if (lockPath) await fs.rm(lockPath, { force: true }).catch(() => {});
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: 0 バイトの空ロックは 120 秒経過していても古いロックとして奪取せず EEXIST で拒否する", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-empty-lock-"));
+  let lockPath = null;
+  try {
+    const targetPng = path.join(tmp, "empty.png");
+    ({ lockPath } = await getTargetLockPaths(targetPng));
+    await fs.writeFile(lockPath, "", { mode: 0o600 });
+    const oldTime = new Date(Date.now() - 120 * 1000);
+    await fs.utimes(lockPath, oldTime, oldTime);
+
+    await assert.rejects(
+      () =>
+        emitDiagramFiles({
+          xml: "<mxfile/>",
+          outPath: targetPng,
+          convertPng: () => ({ png: Buffer.from("P"), width: 10, height: 10 }),
+          convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+        }),
+      (err) => err && err.code === "EEXIST"
+    );
+  } finally {
+    if (lockPath) await fs.rm(lockPath, { force: true }).catch(() => {});
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Low: 死亡 PID の .reclaim スロットが 32 個を超えて存在してもラダーで回収し全スロットを片付ける", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-reclaim-35-"));
+  const dead = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await new Promise((res) => dead.on("close", res));
+
+  let lockPath = null;
+  const createdSlots = [];
+  try {
+    const targetPng = path.join(tmp, "unbounded.png");
+    const { lockDir, lockPath: lp, hash } = await getTargetLockPaths(targetPng);
+    lockPath = lp;
+
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        magic: "drawio-diagrams-lock-v1",
+        pid: dead.pid,
+        nonce: "deadmany",
+        createdAt: Date.now() - 1000,
+      }),
+      { mode: 0o600 }
+    );
+    const lst = await fs.lstat(lockPath);
+    const deadTag = `${lst.dev}_${lst.ino}_deadmany`;
+
+    for (let k = 0; k < 35; k += 1) {
+      const slotPath = path.join(lockDir, `${hash}.reclaim-${deadTag}-${k}`);
+      createdSlots.push(slotPath);
+      await fs.writeFile(
+        slotPath,
+        JSON.stringify({
+          magic: "drawio-diagrams-reclaim-v1",
+          pid: dead.pid,
+          nonce: `deadslot-${k}`,
+          deadTag,
+          slot: k,
+          createdAt: Date.now(),
+        }),
+        { mode: 0o600 }
+      );
+    }
+
+    await emitDiagramFiles({
+      xml: "<mxfile/>",
+      outPath: targetPng,
+      convertPng: () => ({ png: Buffer.from("UNBOUNDED-OK"), width: 10, height: 10 }),
+      convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+    });
+
+    assert.equal(await fs.readFile(targetPng, "utf8"), "UNBOUNDED-OK");
+    assert.equal(fsSync.existsSync(lockPath), false, "回収後のロックが残っています");
+    for (const sp of createdSlots) {
+      assert.equal(fsSync.existsSync(sp), false, `先行スロット ${sp} が片付けられていません`);
+    }
+    assert.equal(
+      fsSync.existsSync(path.join(lockDir, `${hash}.reclaim-${deadTag}-35`)),
+      false,
+      "取得に使用したスロット 35 が残っています"
+    );
+  } finally {
+    for (const sp of createdSlots) await fs.rm(sp, { force: true }).catch(() => {});
+    if (lockPath) await fs.rm(lockPath, { force: true }).catch(() => {});
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: Step Functions JSONata の Arguments.FunctionName を Invoke エッジとして接続し、Payload 内や Pass は誤結線しない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-sfn-jsonata-"));
+  const TF = `
+resource "aws_lambda_function" "worker" {
+  function_name = "worker"
+}
+resource "aws_lambda_function" "mailer" {
+  function_name = "mailer"
+}
+resource "aws_lambda_function" "ignored" {
+  function_name = "ignored"
+}
+
+resource "aws_sfn_state_machine" "jsonata_hcl" {
+  definition = jsonencode({
+    StartAt = "Run"
+    States = {
+      Run = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Arguments = {
+          FunctionName = aws_lambda_function.worker.arn
+          Payload = {
+            FunctionName = aws_lambda_function.mailer.arn
+          }
+        }
+        Next = "After"
+      }
+      After = {
+        Type = "Pass"
+        Arguments = {
+          FunctionName = aws_lambda_function.ignored.arn
+        }
+        End = true
+      }
+    }
+  })
+}
+
+resource "aws_sfn_state_machine" "jsonata_json" {
+  definition = <<EOF
+{
+  "StartAt": "Run",
+  "States": {
+    "Run": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "\${aws_lambda_function.worker.arn}",
+        "Payload": {
+          "FunctionName": "\${aws_lambda_function.mailer.arn}"
+        }
+      },
+      "Next": "After"
+    },
+    "After": {
+      "Type": "Pass",
+      "Arguments": {
+        "FunctionName": "\${aws_lambda_function.ignored.arn}"
+      },
+      "End": true
+    }
+  }
+}
+EOF
+}
+resource "aws_sfn_state_machine" "get_fn_hcl" {
+  definition = jsonencode({
+    StartAt = "Inspect"
+    States = {
+      Inspect = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::aws-sdk:lambda:getFunction"
+        Arguments = {
+          FunctionName = aws_lambda_function.worker.arn
+        }
+        End = true
+      }
+    }
+  })
+}
+
+resource "aws_sfn_state_machine" "get_fn_param" {
+  definition = jsonencode({
+    StartAt = "InspectParam"
+    States = {
+      InspectParam = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::aws-sdk:lambda:getFunction"
+        Parameters = {
+          FunctionName = aws_lambda_function.worker.arn
+        }
+        End = true
+      }
+    }
+  })
+}
+
+resource "aws_sfn_state_machine" "sdk_invoke_jsonata" {
+  definition = jsonencode({
+    StartAt = "InvokeSdk"
+    States = {
+      InvokeSdk = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::aws-sdk:lambda:invoke"
+        Arguments = {
+          FunctionName = aws_lambda_function.worker.arn
+        }
+        End = true
+      }
+    }
+  })
+}
+`;
+  try {
+    await fs.writeFile(path.join(tmp, "main.tf"), TF, "utf8");
+    const spec = await scanTerraformDirectory(tmp, {});
+    const labelsFrom = (id) =>
+      spec.edges.filter((e) => e.from === id).map((e) => `${e.to}=${e.label}`);
+
+    for (const smId of [
+      "aws_sfn_state_machine_jsonata_hcl",
+      "aws_sfn_state_machine_jsonata_json",
+      "aws_sfn_state_machine_sdk_invoke_jsonata",
+    ]) {
+      const edges = labelsFrom(smId);
+      assert.ok(
+        edges.includes("aws_lambda_function_worker=Invoke"),
+        `${smId} の Arguments.FunctionName が Invoke になりません: ${JSON.stringify(edges)}`
+      );
+      assert.ok(
+        !edges.some((e) => e.startsWith("aws_lambda_function_mailer")),
+        `${smId} の Arguments.Payload.FunctionName が誤結線しました: ${JSON.stringify(edges)}`
+      );
+      assert.ok(
+        !edges.some((e) => e.startsWith("aws_lambda_function_ignored")),
+        `${smId} の Pass.Arguments.FunctionName が誤結線しました: ${JSON.stringify(edges)}`
+      );
+    }
+
+    for (const nonInvokeSm of ["aws_sfn_state_machine_get_fn_hcl", "aws_sfn_state_machine_get_fn_param"]) {
+      const edges = labelsFrom(nonInvokeSm);
+      assert.equal(
+        edges.length,
+        0,
+        `${nonInvokeSm} (aws-sdk:lambda:getFunction) に Invoke エッジが付きました: ${JSON.stringify(edges)}`
+      );
+    }
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: export * from を 20 兄弟モジュール並べて最後だけが公開しても継承を解決する", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-star-siblings-"));
+  try {
+    const barrelLines = [];
+    for (let i = 1; i <= 20; i += 1) {
+      const mod = `m${String(i).padStart(2, "0")}`;
+      barrelLines.push(`export * from "./${mod}";`);
+      const body =
+        i === 20
+          ? "export class Base { v: number = 20; }\n"
+          : `export class Helper${i} { n: number = ${i}; }\n`;
+      await fs.writeFile(path.join(tmp, `${mod}.ts`), body, "utf8");
+    }
+    await fs.writeFile(path.join(tmp, "index.ts"), barrelLines.join("\n") + "\n", "utf8");
+    await fs.writeFile(
+      path.join(tmp, "child.ts"),
+      'import { Base } from "./index";\nexport class Child extends Base {}\n',
+      "utf8"
+    );
+
+    const spec = await scanDirectory(tmp, {});
+    const rel = spec.relations.find((r) => r.from === "Child" && r.type === "inheritance");
+    assert.ok(rel, `20 兄弟モジュール末の export * が解決できません: ${JSON.stringify(spec.relations)}`);
+    assert.equal(spec.classes.find((c) => c.id === rel.to).name, "Base");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: drawio2png --all-pages はページ間の未作成親子衝突（Page2 symlink -> Page1/child.png）を 1 ページ目作成前に拒否する", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX symlink 親子衝突テスト");
+    return;
+  }
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-allpages-ancestor-"));
+  try {
+    const twoPageXml =
+      '<mxfile>' +
+      '<diagram id="p1" name="Page-1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/>' +
+      '<mxCell id="a" value="P1" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="80" height="40" as="geometry"/></mxCell>' +
+      "</root></mxGraphModel></diagram>" +
+      '<diagram id="p2" name="Page-2"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/>' +
+      '<mxCell id="b" value="P2" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="80" height="40" as="geometry"/></mxCell>' +
+      "</root></mxGraphModel></diagram>" +
+      "</mxfile>";
+    const inFile = path.join(tmp, "multi.drawio");
+    await fs.writeFile(inFile, twoPageXml, "utf8");
+    const page1Out = path.join(tmp, "out-1-Page-1.png");
+    const page2Out = path.join(tmp, "out-2-Page-2.png");
+    await fs.symlink(path.join("out-1-Page-1.png", "child.png"), page2Out);
+
+    const r = runScript("drawio2png.mjs", ["multi.drawio", "--all-pages", "-o", "out.png"], tmp);
+    assert.notEqual(r.status, 0, "--all-pages 親子衝突が成功してしまいました");
+    assert.match(r.stderr, /親子パスで衝突/);
+    assert.equal(fsSync.existsSync(page1Out), false, "親子衝突検出前にページ1が作成されました");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Medium: drawio2png はシンボリックリンク入力で -o 省略時にリンク配置ディレクトリ・リンク名で出力しリンク先画像を上書きしない", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX symlink テスト");
+    return;
+  }
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-symlink-default-out-"));
+  try {
+    const assetsDir = path.join(tmp, "assets");
+    const workDir = path.join(tmp, "work");
+    await fs.mkdir(assetsDir, { recursive: true });
+    await fs.mkdir(workDir, { recursive: true });
+
+    const twoPageXml =
+      '<mxfile>' +
+      '<diagram id="p1" name="Page-1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/>' +
+      '<mxCell id="a" value="P1" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="80" height="40" as="geometry"/></mxCell>' +
+      "</root></mxGraphModel></diagram>" +
+      '<diagram id="p2" name="Page-2"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/>' +
+      '<mxCell id="b" value="P2" style="rounded=1;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="80" height="40" as="geometry"/></mxCell>' +
+      "</root></mxGraphModel></diagram>" +
+      "</mxfile>";
+    const sourceDrawio = path.join(assetsDir, "source.drawio");
+    const sourcePng = path.join(assetsDir, "source.png");
+    await fs.writeFile(sourceDrawio, twoPageXml, "utf8");
+    await fs.writeFile(sourcePng, "DO_NOT_OVERWRITE", "utf8");
+
+    const aliasDrawio = path.join(workDir, "alias.drawio");
+    await fs.symlink(path.join("..", "assets", "source.drawio"), aliasDrawio);
+
+    const rSingle = runScript("drawio2png.mjs", ["work/alias.drawio"], tmp);
+    assert.equal(rSingle.status, 0, `symlink 既定出力が失敗しました:\n${rSingle.stderr}`);
+    assert.equal(fsSync.existsSync(path.join(workDir, "alias.png")), true, "work/alias.png が生成されていません");
+    assert.equal(await fs.readFile(sourcePng, "utf8"), "DO_NOT_OVERWRITE", "リンク先 assets/source.png が上書きされました");
+
+    const rAll = runScript("drawio2png.mjs", ["work/alias.drawio", "--all-pages"], tmp);
+    assert.equal(rAll.status, 0, `symlink --all-pages 既定出力が失敗しました:\n${rAll.stderr}`);
+    assert.equal(fsSync.existsSync(path.join(workDir, "alias-1-Page-1.png")), true, "work/alias-1-Page-1.png が生成されていません");
+    assert.equal(fsSync.existsSync(path.join(workDir, "alias-2-Page-2.png")), true, "work/alias-2-Page-2.png が生成されていません");
+    assert.equal(fsSync.existsSync(path.join(assetsDir, "source-1-Page-1.png")), false, "リンク先に --all-pages 出力が漏れました");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("Low: stageTempFile は 255 バイト付近の長い出力ファイル名でも ENAMETOOLONG を起こさず一時ファイルを残さない", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "drawio-namemax-"));
+  try {
+    const longXml = path.join(tmp, `${"a".repeat(243)}.drawio`);
+    const longPng = path.join(tmp, `${"a".repeat(246)}.png`);
+    await emitDiagramFiles({
+      xml: "<mxfile>LONG</mxfile>",
+      outPath: longPng,
+      xmlOutPath: longXml,
+      convertPng: () => ({ png: Buffer.from("LONG-PNG"), width: 10, height: 10 }),
+      convertSvg: () => ({ svg: "<svg/>", width: 10, height: 10 }),
+    });
+    assert.equal(await fs.readFile(longXml, "utf8"), "<mxfile>LONG</mxfile>");
+    assert.equal(await fs.readFile(longPng, "utf8"), "LONG-PNG");
+
+    const entries = await fs.readdir(tmp);
+    const leftovers = entries.filter((e) => e.includes(".tmp-"));
+    assert.deepEqual(leftovers, [], `一時ファイルが残っています: ${JSON.stringify(leftovers)}`);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
 });

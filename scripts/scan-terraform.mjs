@@ -18,7 +18,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
-import { isDirectRun } from "./diagram-shared.mjs";
+import {
+  assertOutputsDistinctFromInputs,
+  isDirectRun,
+  resolveWriteTarget,
+  writeFileAtomic,
+} from "./diagram-shared.mjs";
 
 /**
  * Resource classification catalog:
@@ -100,8 +105,11 @@ const GLUE_RESOURCE_TYPES = new Set([
 
 /**
  * Recursively collects all `.tf` files under `rootDir`, skipping `.terraform`, `node_modules`, `.git`.
+ *
+ * 出力先の上書き防止検査（assertOutputsDistinctFromInputs）に渡す一覧もこの関数が
+ * 返す一覧を使う — 別の簡易走査で「入力に無い」と誤判定する事故を防ぐ。
  */
-async function findTerraformFiles(rootDir) {
+export async function collectTerraformFiles(rootDir) {
   const results = [];
   const skipDirs = new Set([".terraform", "node_modules", ".git", "dist", "out"]);
 
@@ -234,6 +242,252 @@ function extractResourceReferences(body) {
   }
   return [...refs];
 }
+
+/**
+ * 明示的な `depends_on = [...]` を本文から取り除く。
+ *
+ * `depends_on` は「作成順序の宣言」であって実行の接続ではない。これを参照抽出に
+ * 残すと、`aws_apigatewayv2_integration` に `depends_on = [aws_lambda_function.mailer]`
+ * と書いただけで mailer への Invoke 線が生まれてしまう。
+ * 文字列リテラルと入れ子配列を壊さずに、対応する `]` までを空白へ置き換える
+ * （改行はそのまま残るので他の属性の位置は動かない）。
+ */
+function stripDependsOn(body) {
+  const text = String(body || "");
+  if (!/\bdepends_on\s*=/.test(text)) return text;
+  const re = /\bdepends_on\s*=\s*\[/g;
+  let out = "";
+  let cursor = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    let i = re.lastIndex - 1; // 開き `[`
+    let depth = 0;
+    let inStr = false;
+    for (; i < text.length; i += 1) {
+      const ch = text[i];
+      if (inStr) {
+        if (ch === "\\") {
+          i += 1;
+          continue;
+        }
+        if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === "[") depth += 1;
+      else if (ch === "]") {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    const end = i < text.length ? i + 1 : text.length; // 閉じ `]` の次
+    out += text.slice(cursor, m.index) + " ";
+    cursor = end;
+    re.lastIndex = end;
+  }
+  out += text.slice(cursor);
+  return out;
+}
+
+/**
+ * 接続の根拠となる参照アドレスを本文から集める（`depends_on` は根拠にしない）。
+ * 参照抽出をするときは必ずこの関数を通すこと。
+ */
+function extractConnectionReferences(body) {
+  return extractResourceReferences(stripDependsOn(body));
+}
+
+/**
+ * 指定した属性名（`api_id` / `integration_uri` / `event_source_arn` など）の
+ * 値に現れる `aws_type.name` アドレスだけを集める。glue リソースの接続先を
+ * 「属性名の意味」で決めるために使う。
+ * @param {string} body
+ * @param {string[]} attrNames
+ * @param {{ topLevelOnly?: boolean }} [opts] `true` のときはトップレベル（波括弧深さ 0）の属性だけを見る
+ */
+function extractAttributeReferences(body, attrNames, { topLevelOnly = false } = {}) {
+  const addrs = new Set();
+  const text = String(body || "");
+  const attrSet = new Set(attrNames || []);
+  if (attrSet.size === 0) return [];
+
+  const n = text.length;
+  let depth = 0;
+  let i = 0;
+
+  const skipHclString = (from) => {
+    let p = from + 1;
+    while (p < n) {
+      const ch = text[p];
+      if (ch === "\\") {
+        p += 2;
+        continue;
+      }
+      if (ch === "$" && text[p + 1] === "{") {
+        let interpDepth = 0;
+        while (p < n) {
+          if (text[p] === '"') {
+            p = skipHclString(p);
+            continue;
+          }
+          if (text[p] === "{") interpDepth += 1;
+          else if (text[p] === "}") {
+            interpDepth -= 1;
+            if (interpDepth === 0) {
+              p += 1;
+              break;
+            }
+          }
+          p += 1;
+        }
+        continue;
+      }
+      if (ch === '"') return p + 1;
+      p += 1;
+    }
+    return n;
+  };
+
+  const readExprEnd = (from) => {
+    let p = from;
+    while (p < n && (text[p] === " " || text[p] === "\t")) p += 1;
+    let exprDepth = 0;
+    while (p < n) {
+      const ch = text[p];
+      if (ch === '"') {
+        p = skipHclString(p);
+        continue;
+      }
+      if (ch === "(" || ch === "[" || ch === "{") {
+        exprDepth += 1;
+        p += 1;
+        continue;
+      }
+      if (ch === ")" || ch === "]" || ch === "}") {
+        if (exprDepth > 0) exprDepth -= 1;
+        p += 1;
+        continue;
+      }
+      if (ch === "\n" && exprDepth === 0) break;
+      p += 1;
+    }
+    return p;
+  };
+
+  while (i < n) {
+    const ch = text[i];
+    if (ch === '"') {
+      i = skipHclString(i);
+      continue;
+    }
+    if (ch === "{") {
+      depth += 1;
+      i += 1;
+      continue;
+    }
+    if (ch === "}") {
+      if (depth > 0) depth -= 1;
+      i += 1;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(ch) && (i === 0 || !/[A-Za-z0-9_]/.test(text[i - 1]))) {
+      let j = i + 1;
+      while (j < n && /[A-Za-z0-9_]/.test(text[j])) j += 1;
+      const ident = text.slice(i, j);
+      let k = j;
+      while (k < n && (text[k] === " " || text[k] === "\t")) k += 1;
+      if (text[k] === "=" && text[k + 1] !== "=" && attrSet.has(ident) && (!topLevelOnly || depth === 0)) {
+        const exprEnd = readExprEnd(k + 1);
+        for (const addr of extractResourceReferences(text.slice(k + 1, exprEnd))) {
+          addrs.add(addr);
+        }
+      }
+      i = j;
+      continue;
+    }
+    i += 1;
+  }
+  return [...addrs];
+}
+
+/**
+ * glue リソース（integration / event source mapping / target / subscription など）の
+ * 接続規則。「どちらの属性が起点で、どちらの属性が接続先か」を属性名で持つ。
+ *
+ *   sourceAttrs → 図の始点側（API Gateway / イベントソース / ルール / トピック / ALB）
+ *   targetAttrs → 図の終点側（Lambda / SQS / SNS / ターゲットグループ）
+ *
+ * 接続は「起点・終点ともに属性名で解決できたもの」だけを根拠にする。
+ * 未解決時に本文全体（redrive_policy / dead_letter_config など）へフォールバックしない。
+ */
+const GLUE_CONNECT_RULES = {
+  aws_apigatewayv2_integration: {
+    sourceAttrs: ["api_id", "rest_api_id"],
+    targetAttrs: ["integration_uri"],
+    sourceKinds: ["apigw"],
+    label: "Invoke",
+    edgeType: "flow",
+  },
+  aws_api_gateway_integration: {
+    sourceAttrs: ["rest_api_id", "api_id"],
+    targetAttrs: ["integration_uri", "uri"],
+    sourceKinds: ["apigw"],
+    label: "Invoke",
+    edgeType: "flow",
+  },
+  aws_lambda_event_source_mapping: {
+    sourceAttrs: ["event_source_arn", "self_managed_event_source"],
+    targetAttrs: ["function_name"],
+    targetKinds: ["lambda"],
+    label: "Trigger / Poll",
+    edgeType: "async",
+  },
+  aws_cloudwatch_event_target: {
+    sourceAttrs: ["rule"],
+    targetAttrs: ["arn"],
+    topLevelTarget: true,
+    sourceKinds: ["eventbridge"],
+    label: "Target",
+    edgeType: "async",
+  },
+  aws_sns_topic_subscription: {
+    sourceAttrs: ["topic_arn"],
+    targetAttrs: ["endpoint"],
+    topLevelSource: true,
+    topLevelTarget: true,
+    sourceKinds: ["sns"],
+    label: "Subscribe",
+    edgeType: "async",
+  },
+  aws_s3_bucket_notification: {
+    sourceAttrs: ["bucket"],
+    targetAttrs: ["lambda_function_arn", "queue_arn", "topic_arn"],
+    sourceKinds: ["s3"],
+    label: "S3 Event",
+    edgeType: "async",
+  },
+  aws_lb_listener: {
+    sourceAttrs: ["load_balancer_arn"],
+    targetAttrs: ["target_group_arn"],
+    sourceKinds: ["alb"],
+    label: "Forward",
+    edgeType: "flow",
+  },
+  aws_lb_listener_rule: {
+    sourceAttrs: ["load_balancer_arn"],
+    targetAttrs: ["target_group_arn"],
+    sourceKinds: ["alb"],
+    label: "Forward",
+    edgeType: "flow",
+  },
+  aws_lb_target_group: {
+    sourceAttrs: ["load_balancer_arn"],
+    targetAttrs: ["target_group_arn"],
+    sourceKinds: ["alb"],
+    label: "Forward",
+    edgeType: "flow",
+  },
+};
 
 function buildResourceSubtitle(type, name, body) {
   const details = [];
@@ -472,21 +726,30 @@ function aslDirectChild(node, key) {
   return node.keys.get(key) ?? null;
 }
 
+const SFN_LAMBDA_INVOKE_RESOURCE_RE =
+  /^arn:aws(?:-[a-z0-9-]+)?:states:[^:]*:[^:]*:(?:aws-sdk:)?lambda:invoke(?:\.[A-Za-z0-9_-]+)?$/;
+
 /**
  * ASL（State Machine Definition）から **「Type が Task のステート」にある
- * Resource / Parameters.FunctionName に現れる参照アドレスだけ**を収集する。
+ * 実行先 Resource、および `lambda:invoke` / `aws-sdk:lambda:invoke` 系タスクの
+ * Parameters.FunctionName / Arguments.FunctionName に現れる参照アドレスだけ**を収集する。
  *
  * 判定は `parseAslValue()` が作った階層ツリーに対して行う。
  *
  *   - `Type` が直接の子で、その値が `Task` のオブジェクトだけを対象にする
  *   - `Resource` はそのオブジェクトの直下（相対深さ 0）だけを見る
- *   - `FunctionName` は `Parameters` の直下（相対深さ 1）だけを見る
- *     よって `Parameters.Payload.FunctionName` は Invoke の根拠にならない
- *   - `Parallel` / `Map` の `Branches` / `Items` の中に入れた入れ子 Task も
- *     再帰的に同じ規則で拾う
+ *   - `FunctionName` は `Resource` が `lambda:invoke` / `aws-sdk:lambda:invoke` 系の場合のみ
+ *     `Parameters` / `Arguments`（JSONata）の直下（相対深さ 1）を見る
+ *     よって `aws-sdk:lambda:getFunction` や `Parameters.Payload.FunctionName` /
+ *     `Arguments.Payload.FunctionName` は Invoke の根拠にならない
+ *   - 再帰するのは状態機械の構造をたどるときだけ:
+ *       `Parallel` → 直下 `Branches[]` の各要素
+ *       `Map`      → 直下 `Iterator` / `ItemProcessor`（`ProcessorArn` も実行先）
  *
- * Pass ステートの `Result` や Payload テンプレートなど、実行の根拠にならない
- * 箇所に ARN が現れても Invoke / Task エッジの根拠にしない。
+ * **`Pass` / `Choice` / `Wait` / `Succeed` / `Fail` の `Result`・`ResultPath`・
+ * `Parameters`・`Arguments`・`Output`・`InputPath` は実行の根拠にならないので立ち入らない。**
+ * かつてはオブジェクトの全ての子へ無条件に再帰していたため、`Pass` の
+ * `Result` に Lambda ARN を書くだけで Invoke エッジが生まれていた。
  * JSON 表記（`"Type": "Task"`）と HCL jsonencode のオブ構文（`Type = "Task"`）
  * の両方に対応する。
  */
@@ -495,35 +758,66 @@ function extractSfnTaskRefAddrs(definitionSection) {
   const text = String(definitionSection || "");
   if (!text) return addrs;
 
-  const collectFrom = (node) => {
+  const addFrom = (node) => {
     if (!node) return;
-    if (node.kind === "array") {
-      for (const item of node.items) collectFrom(item);
-      return;
+    if (node.kind === "string" || node.kind === "token") {
+      for (const addr of extractResourceReferences(node.text ?? "")) addrs.add(addr);
     }
-    if (node.kind !== "object") return;
-
-    const typeNode = aslDirectChild(node, "Type");
-    const typeValue =
-      typeNode && (typeNode.kind === "string" || typeNode.kind === "token")
-        ? typeNode.text.trim()
-        : "";
-    if (typeValue === "Task") {
-      const resource = aslDirectChild(node, "Resource");
-      if (resource) {
-        for (const addr of extractResourceReferences(resource.text ?? "")) addrs.add(addr);
-      }
-      const params = aslDirectChild(node, "Parameters");
-      const functionName = aslDirectChild(params, "FunctionName");
-      if (functionName) {
-        for (const addr of extractResourceReferences(functionName.text ?? "")) addrs.add(addr);
-      }
-    }
-
-    for (const child of node.keys.values()) collectFrom(child);
+  };
+  const directText = (node, key) => {
+    const child = aslDirectChild(node, key);
+    return child && (child.kind === "string" || child.kind === "token")
+      ? child.text.trim()
+      : "";
   };
 
-  collectFrom(parseAslValue(text, 0).node);
+  /** `States` を持つオブジェクト（定義本体・Parallel の分岐・Map のサブ状態機械）を歩く。 */
+  const collectFromStateMachine = (node) => {
+    if (!node || node.kind !== "object") return;
+    const states = aslDirectChild(node, "States");
+    if (states && states.kind === "object") {
+      for (const stateNode of states.keys.values()) collectFromState(stateNode);
+      return;
+    }
+    // `Branches` の要素のように、ノードそのものがステート定義の場合も受け取る
+    if (directText(node, "Type")) collectFromState(node);
+  };
+
+  /** `States` の値 1 つ（ステート定義）を、Type に応じて構造に沿って見る。 */
+  const collectFromState = (stateNode) => {
+    if (!stateNode || stateNode.kind !== "object") return;
+    const type = directText(stateNode, "Type");
+
+    if (type === "Task") {
+      const resourceNode = aslDirectChild(stateNode, "Resource");
+      addFrom(resourceNode);
+      const resourceText = directText(stateNode, "Resource");
+      if (SFN_LAMBDA_INVOKE_RESOURCE_RE.test(resourceText)) {
+        addFrom(aslDirectChild(aslDirectChild(stateNode, "Parameters"), "FunctionName"));
+        addFrom(aslDirectChild(aslDirectChild(stateNode, "Arguments"), "FunctionName"));
+      }
+      return;
+    }
+    if (type === "Parallel") {
+      const branches = aslDirectChild(stateNode, "Branches");
+      if (branches && branches.kind === "array") {
+        for (const branch of branches.items) collectFromStateMachine(branch);
+      }
+      return;
+    }
+    if (type === "Map") {
+      collectFromStateMachine(aslDirectChild(stateNode, "Iterator"));
+      const processor = aslDirectChild(stateNode, "ItemProcessor");
+      if (processor) {
+        collectFromStateMachine(processor);
+        addFrom(aslDirectChild(processor, "ProcessorArn"));
+      }
+      return;
+    }
+    // Pass / Choice / Wait / Succeed / Fail — ここには立ち入らない
+  };
+
+  collectFromStateMachine(parseAslValue(text, 0).node);
   return addrs;
 }
 
@@ -541,6 +835,8 @@ export async function scanTerraformDirectory(
     includeCategories = [],
     title = null,
     subtitle = null,
+    files = null,
+    scannedInputFiles = null,
   } = {}
 ) {
   const includeSet = new Set(
@@ -548,7 +844,10 @@ export async function scanTerraformDirectory(
   );
   const includeAll = includeSet.has("all");
 
-  const tfFiles = await findTerraformFiles(tfDir);
+  // `files` を渡すとその一覧をそのまま走査する（呼び出し側の上書き防止検査と
+  // 同じ一覧を共有するため）。`scannedInputFiles` 配列には実走査一覧を詰め戻す。
+  const tfFiles = files ? files.map((f) => path.resolve(f)) : await collectTerraformFiles(tfDir);
+  if (Array.isArray(scannedInputFiles)) scannedInputFiles.push(...tfFiles);
   if (tfFiles.length === 0) {
     throw new Error(`No .tf files found under: ${tfDir}`);
   }
@@ -578,12 +877,15 @@ export async function scanTerraformDirectory(
       const key = `${moduleKey}::${addr}`;
 
       if (GLUE_RESOURCE_TYPES.has(blk.type)) {
+        // refBody: depends_on を除いた本文。glue の接続先はこの本文から決める。
+        const refBody = stripDependsOn(blk.body);
         glueBlocks.push({
           ...blk,
           addr,
           moduleKey,
           file: relFile,
-          refs: extractResourceReferences(blk.body),
+          refBody,
+          refs: extractResourceReferences(refBody),
         });
         continue;
       }
@@ -651,7 +953,7 @@ export async function scanTerraformDirectory(
         serviceLabel: meta.label,
         subtitle: buildResourceSubtitle(blk.type, blk.name, blk.body),
         file: relFile,
-        refs: extractResourceReferences(blk.body),
+        refs: extractConnectionReferences(blk.body),
         body: blk.body,
         _definitionSection: definitionSection,
         _originSection: originSection,
@@ -769,8 +1071,8 @@ export async function scanTerraformDirectory(
       if (res.kind === "cloudfront" && refAppearsIn(res._originSection, refAddr)) {
         addEdge(key, toKey, "Origin", "flow");
       } else if (res.kind === "sfn") {
-        // ASL の「Type が Task のステート」の Resource / Parameters.FunctionName に
-        // 現れる参照だけを実行の根拠とする。Pass ステートの Result など、
+        // ASL の「Type が Task のステート」の Resource / Parameters.FunctionName /
+        // Arguments.FunctionName に現れる参照だけを実行の根拠とする。Pass ステートの Result など、
         // 実行を意味しない箇所の ARN 出現では Invoke / Task エッジを作らない。
         if (res._invokeRefAddrs && res._invokeRefAddrs.has(refAddr)) {
           addEdge(
@@ -793,43 +1095,36 @@ export async function scanTerraformDirectory(
 
   // 2. Glue resources that connect two included AWS resources
   //    （integration / event source mapping / target などは実行の根拠があるため操作ラベルを付ける）
+  //
+  // 接続の向きと対象は「属性名の意味」だけで決める。起点属性（topic_arn 等）または
+  // 終点属性（endpoint 等）が本文内の変数を指していて解決できない場合に、
+  // redrive_policy / dead_letter_config など他属性の SQS へ誤結線しないため、
+  // 本文全体（glue.refs）へのフォールバックは行わない。
+  const kindOf = (k) => allResources.get(k).kind;
   for (const glue of glueBlocks) {
     const glueKey = `${glue.moduleKey}::${glue.addr}`;
-    const includedRefs = [...new Set(glue.refs.map((r) => resolveRef(glueKey, r)).filter(Boolean))];
-    if (includedRefs.length < 2) continue;
-    const kindOf = (k) => allResources.get(k).kind;
+    const rule = GLUE_CONNECT_RULES[glue.type];
+    if (!rule) continue;
+    const resolveAll = (addrs) =>
+      [...new Set((addrs || []).map((a) => resolveRef(glueKey, a)).filter(Boolean))];
 
-    if (
-      glue.type === "aws_api_gateway_integration" ||
-      glue.type === "aws_apigatewayv2_integration"
-    ) {
-      const apiRef = includedRefs.find((r) => kindOf(r) === "apigw");
-      const targetRef = includedRefs.find((r) => r !== apiRef);
-      if (apiRef && targetRef) addEdge(apiRef, targetRef, "Invoke", "flow");
-    } else if (glue.type === "aws_lambda_event_source_mapping") {
-      const lambdaRef = includedRefs.find((r) => kindOf(r) === "lambda");
-      const sourceRef = includedRefs.find((r) => r !== lambdaRef);
-      if (sourceRef && lambdaRef) addEdge(sourceRef, lambdaRef, "Trigger / Poll", "async");
-    } else if (glue.type === "aws_s3_bucket_notification") {
-      const s3Ref = includedRefs.find((r) => kindOf(r) === "s3");
-      for (const r of includedRefs) {
-        if (r !== s3Ref && s3Ref) addEdge(s3Ref, r, "S3 Event", "async");
-      }
-    } else if (glue.type === "aws_sns_topic_subscription") {
-      const snsRef = includedRefs.find((r) => kindOf(r) === "sns");
-      for (const r of includedRefs) {
-        if (r !== snsRef && snsRef) addEdge(snsRef, r, "Subscribe", "async");
-      }
-    } else if (glue.type === "aws_cloudwatch_event_target") {
-      const ruleRef = includedRefs.find((r) => kindOf(r) === "eventbridge");
-      for (const r of includedRefs) {
-        if (r !== ruleRef && ruleRef) addEdge(ruleRef, r, "Target", "async");
-      }
-    } else if (glue.type === "aws_lb_listener" || glue.type === "aws_lb_target_group") {
-      const lbRef = includedRefs.find((r) => kindOf(r) === "alb");
-      for (const r of includedRefs) {
-        if (r !== lbRef && lbRef) addEdge(lbRef, r, "Forward", "flow");
-      }
+    let sourceKeys = resolveAll(
+      extractAttributeReferences(glue.refBody, rule.sourceAttrs, {
+        topLevelOnly: rule.topLevelSource === true,
+      })
+    );
+    let targetKeys = resolveAll(
+      extractAttributeReferences(glue.refBody, rule.targetAttrs, {
+        topLevelOnly: rule.topLevelTarget === true,
+      })
+    );
+    if (rule.sourceKinds) sourceKeys = sourceKeys.filter((k) => rule.sourceKinds.includes(kindOf(k)));
+    if (rule.targetKinds) targetKeys = targetKeys.filter((k) => rule.targetKinds.includes(kindOf(k)));
+
+    if (sourceKeys.length === 0 || targetKeys.length === 0) continue;
+
+    for (const s of sourceKeys) {
+      for (const t of targetKeys) addEdge(s, t, rule.label, rule.edgeType);
     }
   }
 
@@ -910,16 +1205,35 @@ async function main() {
     ? values.include.split(",").map((s) => s.trim()).filter(Boolean)
     : [];
 
+  // 書き込み前の必須検査: `-o` に .tf やその親ディレクトリを指定されたら、
+  // 1 バイトも書く前に止まる（表記だけでなく realpath と (dev, ino) で実体比較する）
+  const outputs = [{ role: "-o / --output", value: values.output }];
+  const inputEntries = [{ role: "--tf-dir", value: tfDir }];
+  const plannedFiles = await collectTerraformFiles(tfDir);
+  assertOutputsDistinctFromInputs({
+    inputs: [...inputEntries, { role: "スキャン対象 (.tf)", files: plannedFiles }],
+    outputs,
+  });
+
+  const scannedInputFiles = [];
   const spec = await scanTerraformDirectory(tfDir, {
     includeCategories,
     title: values.title,
     subtitle: values.subtitle,
+    files: plannedFiles,
+    scannedInputFiles,
+  });
+
+  // 実際に走査した一覧で、書き込み直前にもう一度確かめる
+  assertOutputsDistinctFromInputs({
+    inputs: [...inputEntries, { role: "スキャン対象 (.tf)", files: scannedInputFiles }],
+    outputs,
   });
 
   const jsonStr = JSON.stringify(spec, null, 2);
   if (values.output) {
-    await fs.mkdir(path.dirname(path.resolve(values.output)), { recursive: true });
-    await fs.writeFile(values.output, jsonStr, "utf8");
+    await fs.mkdir(path.dirname(resolveWriteTarget(values.output)), { recursive: true });
+    await writeFileAtomic(values.output, jsonStr);
     console.error(
       `Scanned ${spec.scannedFiles} .tf files -> ${spec.nodes.length} nodes, ${spec.edges.length} edges -> ${values.output}`
     );

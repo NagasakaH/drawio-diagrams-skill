@@ -25,6 +25,8 @@ import {
   createCellIdMap,
   emitDiagramFiles,
   isDirectRun,
+  resolveWriteTarget,
+  writeFileAtomic,
 } from "./diagram-shared.mjs";
 
 // ---------------------------------------------------------------------------
@@ -901,8 +903,8 @@ export async function run(argv = process.argv.slice(2)) {
   ]);
 
   if (values["no-png"]) {
-    await fsp.mkdir(path.dirname(path.resolve(xmlOut)), { recursive: true });
-    await fsp.writeFile(xmlOut, xml, "utf8");
+    await fsp.mkdir(path.dirname(resolveWriteTarget(xmlOut)), { recursive: true });
+    await writeFileAtomic(xmlOut, xml);
     console.log(`${output} の元 XML -> ${xmlOut}`);
     return;
   }

@@ -11,12 +11,13 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
 import { convertXmlToPng, convertXmlToSvg } from "./drawio2png.mjs";
-import { scanTerraformDirectory } from "./scan-terraform.mjs";
+import { scanTerraformDirectory, collectTerraformFiles } from "./scan-terraform.mjs";
 import {
   assertOutputsDistinctFromInputs,
   createCellIdMap,
   emitDiagramFiles,
-  expandInputPaths,
+  resolveWriteTarget,
+  writeFileAtomic,
   isDirectRun,
 } from "./diagram-shared.mjs";
 
@@ -978,21 +979,32 @@ async function main() {
   const xmlOutPath =
     values["xml-out"] ||
     outPath.replace(/\.drawio\.png$|\.png$|\.svg$/i, "") + ".drawio";
-  const tfFiles = values.spec
-    ? []
-    : (await expandInputPaths(tfDir ? [tfDir] : [], /\.tf$/i)).files;
-
-  assertOutputsDistinctFromInputs({
-    inputs: values.spec
+  const outputEntries = [
+    { role: "--json-out", value: values["json-out"] },
+    { role: "--xml-out", value: xmlOutPath },
+    { role: "--output", value: outPath },
+  ];
+  // 照合には scan-terraform と同じ走査関数（collectTerraformFiles）の一覧を使う
+  const clashInputs = (tfFiles) =>
+    values.spec
       ? [{ role: "--spec", value: values.spec }]
-      : [{ role: "--tf-dir", value: tfDir, files: tfFiles }],
-    outputs: [
-      { role: "--json-out", value: values["json-out"] },
-      { role: "--xml-out", value: xmlOutPath },
-      { role: "--output", value: outPath },
-    ],
-  });
+      : [
+          { role: "--tf-dir", value: tfDir },
+          { role: "--tf-dir（スキャン対象）", files: tfFiles },
+        ];
 
+  let plannedTfFiles = [];
+  if (values.spec) {
+    assertOutputsDistinctFromInputs({ inputs: clashInputs([]), outputs: outputEntries });
+  } else {
+    plannedTfFiles = await collectTerraformFiles(tfDir || ".");
+    assertOutputsDistinctFromInputs({
+      inputs: clashInputs(plannedTfFiles),
+      outputs: outputEntries,
+    });
+  }
+
+  const scannedTfFiles = [];
   let spec;
   if (values.spec) {
     spec = JSON.parse(await fs.readFile(values.spec, "utf8"));
@@ -1006,10 +1018,17 @@ async function main() {
       includeCategories,
       title: values.title,
       subtitle: values.subtitle,
+      files: plannedTfFiles,
+      scannedInputFiles: scannedTfFiles,
+    });
+    // 書き込み直前に、実際に走査した一覧でもう一度検査する
+    assertOutputsDistinctFromInputs({
+      inputs: clashInputs(scannedTfFiles),
+      outputs: outputEntries,
     });
     if (values["json-out"]) {
-      await fs.mkdir(path.dirname(path.resolve(values["json-out"])), { recursive: true });
-      await fs.writeFile(values["json-out"], JSON.stringify(spec, null, 2), "utf8");
+      await fs.mkdir(path.dirname(resolveWriteTarget(values["json-out"])), { recursive: true });
+      await writeFileAtomic(values["json-out"], JSON.stringify(spec, null, 2));
       console.log(`Generated JSON: ${values["json-out"]}`);
     }
   }
@@ -1021,6 +1040,14 @@ async function main() {
   const scale = Number.isFinite(parsedScale) && parsedScale > 0 ? parsedScale : 2;
   const parsedBorder = parseInt(values.border, 10);
   const border = Number.isFinite(parsedBorder) && parsedBorder >= 0 ? parsedBorder : 16;
+
+  if (!values.spec) {
+    // .drawio / 画像を書く直前にも同じ実走査一覧で再検査する
+    assertOutputsDistinctFromInputs({
+      inputs: clashInputs(scannedTfFiles),
+      outputs: outputEntries,
+    });
+  }
 
   // 先にメモリ上で変換し、成功してから .drawio / 画像を書き出す
   const { res, isSvg } = await emitDiagramFiles({

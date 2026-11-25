@@ -158,34 +158,49 @@ drawio-diagrams-skill/
 
 ## ライセンスとサードパーティ OSS
 
-本スキルは Apache-2.0 ライセンスです（[LICENSE](LICENSE)）。
-同梱の `scripts/drawio2png.mjs` は次のサードパーティ資産を内部に含みます。
+**ライセンスはファイル単位で 2 系統**に分かれています（MPL-2.0 はファイル単位で適用される
+ライセンスなので、境界をファイルで明確に切り分けています）。
+
+| 対象 | ライセンス |
+|---|---|
+| `scripts/drawio2png.mjs`（共通コンバーター 1 ファイル） | **MPL-2.0**（ファイル全体） |
+| その他のすべてのファイル（`scripts/build-*.mjs`・`scripts/scan-*.mjs`・`scripts/drawio-cli.mjs`・`scripts/diagram-shared.mjs`・`scripts/check-layout.mjs`・`SKILL.md`・`references/`・`examples/`・`tests/`） | Apache-2.0（[LICENSE](LICENSE)） |
+
+この 2 系統をまとめて配布する形は、MPL-2.0 §1.7 / §3.3 がいう **Larger Work** です。
+Larger Work 全体は Apache-2.0 で配布してよいのですが、`scripts/drawio2png.mjs` が受ける
+MPL-2.0 の権利を制限することはできないため、同ファイルは常に MPL-2.0 のまま、
+ファイル冒頭の通知・[NOTICE](NOTICE)・本節が帰属通知として随行します。
+同ファイルだけをコピーして持ち出した場合も MPL-2.0 の配布物になります。
+
+### `scripts/drawio2png.mjs`（MPL-2.0）に内包するサードパーティ資産
 
 | 資産 | 版 | 来歴 URL | ライセンス |
 |---|---|---|---|
 | draw.io（mxGraph のシェイプ / ステンシル / 既定スタイル） | v29.6.6 | <https://github.com/jgraph/drawio/tree/v29.6.6> | Apache-2.0 |
 | `@resvg/resvg-wasm`（SVG → PNG の WebAssembly ラスタライザ） | 2.6.2 | <https://github.com/thx/resvg-js/tree/v2.6.2> | [MPL-2.0](https://www.mozilla.org/en-US/MPL/2.0/) |
 
-WebAssembly バイナリ（`index_bg.wasm`）は npm の `@resvg/resvg-wasm@2.6.2` のビルド成果物を
-改変せず base64 で埋め込んでいます。一方、その wasm-bindgen JavaScript グルーコード
-（上流の `index.mjs` / `index.js` と `wasm-binding.ts`）は別ファイルとして置かず
-`drawio2png.mjs` の中に実行可能 JS として直接組み込み、埋め込み base64 から同期的に
-インスタンス化する形へ合わせ込んでいるため、**修正した版**として収録しています。
-
-- **MPL-2.0 が適用される範囲** — `scripts/drawio2png.mjs` 内の
-  `// BEGIN MPL-2.0 COVERED SOFTWARE (@resvg/resvg-wasm v2.6.2)` 〜
-  `// END MPL-2.0 COVERED SOFTWARE (@resvg/resvg-wasm v2.6.2)` で明示した箇所だけです
-  （未改変の `index_bg.wasm` の base64 と、同期初期化へ対応済みの JS グルー）。
-- **修正版の Source Code Form の所在** — 上の BEGIN / END で囲まれたブロック、つまり
-  本リポジトリ（配布アーカイブ）内の `scripts/drawio2png.mjs` そのものが修正版の
-  Source Code Form です。人間が読める非圧縮・非難読化の JavaScript ソースとして
-  そのまま同梱・配布しているため、修正版だけを取り出すために別途ダウンロードする必要は
-  ありません。改変前の上流ソースは上の来歴 URL に、MPL-2.0 の全文は
-  <https://www.mozilla.org/en-US/MPL/2.0/> に公開されています。
-- **`drawio2png.mjs` 全体のライセンス** — MPL-2.0 §3.3 がいう Larger Work（Apache-2.0
-  部分と MPL-2.0 部分をひとつにまとめて配布する形）です。本スキルが書いたラッパーコードと
-  draw.io 資産は Apache-2.0、上記ブロックは MPL-2.0 のままで、どちらも本プロジェクトで
-  再ライセンスしません。
+- **MPL-2.0 の適用範囲** — `scripts/drawio2png.mjs` **ファイル全体**です。MPL-2.0 は
+  §1.4・§1.10(b)・§3.1・§3.2・§3.3 のとおりファイル単位で適用されるため、同一ファイル内を
+  コメントで区切って「そのブロックだけ MPL-2.0」にする扱いはしていません。ファイル内の
+  `// BEGIN MPL-2.0 UPSTREAM CODE (@resvg/resvg-wasm v2.6.2)` 〜
+  `// END MPL-2.0 UPSTREAM CODE (@resvg/resvg-wasm v2.6.2)` は、埋め込み元（未改変の
+  `index_bg.wasm` の base64 と、同期初期化へ対応済みの JS グルー）の所在を指す**来歴メモ**
+  であり、ライセンスの境界ではありません。
+- **Source Code Form の所在** — JavaScript コンバーター本体および**修正済み JS グルー**
+  （§1.10(b)・§1.13・§3.1）については、本リポジトリに同梱している
+  `scripts/drawio2png.mjs` そのものが Source Code Form です（非圧縮・非難読化の
+  JavaScript としてそのまま配布しているため、別途ダウンロードは不要です）。一方、埋め込んだ
+  WebAssembly バイナリ `index_bg.wasm` は未改変のコンパイル済みビルド成果物（Executable Form /
+  §1.6）であり Source Code Form ではないため、対応する Rust/WASM 側および改変前 JS グルーの
+  上流 Source Code Form は MPL-2.0 §3.2 に従い <https://github.com/thx/resvg-js/tree/v2.6.2>
+  にて入手できます。MPL-2.0 の全文は <https://www.mozilla.org/en-US/MPL/2.0/> に公開されています。
+- **組み込み形態** — WebAssembly バイナリ（`index_bg.wasm`）は npm `@resvg/resvg-wasm@2.6.2`
+  のビルド成果物（Executable Form）を改変せず base64 で埋め込んでいます。一方、その wasm-bindgen の
+  JavaScript グルーコード（上流の `index.mjs` / `index.js` と `wasm-binding.ts`）は
+  別ファイルとして置かず `drawio2png.mjs` の中に実行可能 JS として直接組み込み、
+  埋め込み base64 から同期的にインスタンス化する形へ合わせ込んでいるため、
+  **修正した版**の Source Code Form として収録しています（修正版も MPL-2.0 のままで、
+  本プロジェクトで再ライセンスしません）。draw.io 資産は Apache-2.0 の帰属表示のままです。
 
 draw.io の資産も同タグから取得したものを再圧縮して埋め込んでいます。
 AWS / GCP / Cisco / Kubernetes などのベンダーアイコンはそれぞれ公式の商標・利用条件に従います。

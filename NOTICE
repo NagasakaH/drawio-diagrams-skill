@@ -1,8 +1,58 @@
 drawio-diagrams-skill
 
-This product bundles the shared converter `scripts/drawio2png.mjs` (used by all eight
-diagram builders), which includes third-party
-software and stencil/shape assets derived from:
+================================================================================
+LICENSE BOUNDARY OF THIS REPOSITORY
+================================================================================
+
+* `scripts/drawio2png.mjs` -- the shared converter used by all eight diagram
+  builders -- is distributed, AS A WHOLE FILE, under the Mozilla Public License,
+  Version 2.0 ("MPL-2.0"); full text: https://www.mozilla.org/en-US/MPL/2.0/ .
+  MPL-2.0 attaches to a file, not to an excerpt of one: section 1.4 defines the
+  Covered Software as the Source Code Form (section 1.13), Executable Form
+  (section 1.6), and Modifications (section 1.10) of that file; section 1.10(b)
+  makes this new file combining upstream MPL-2.0 JavaScript code a file of
+  Modifications in Source Code Form; section 3.1 governs distribution of the
+  Source Code Form; section 3.2 governs distribution of unmodified upstream
+  Executable Form; and section 3.3 governs the Larger Work it may be shipped in.
+  Comment markers inside `scripts/drawio2png.mjs` are provenance notes only;
+  they do not narrow the MPL-2.0 coverage of the file.
+
+* Every other file of this project -- `scripts/build-*.mjs`,
+  `scripts/scan-*.mjs`, `scripts/drawio-cli.mjs`, `scripts/diagram-shared.mjs`,
+  `scripts/check-layout.mjs`, `SKILL.md`, `references/`, `examples/` and
+  `tests/` -- is an independent file licensed under the Apache License,
+  Version 2.0 (see the LICENSE file at the repository root).
+
+Distributing those Apache-2.0 files together with the MPL-2.0 file above makes a
+"Larger Work" in the sense of MPL-2.0 sections 1.7 and 3.3: the Larger Work may
+be distributed under Apache-2.0 provided the rights MPL-2.0 grants in
+`scripts/drawio2png.mjs` are not limited. Anyone who takes only
+`scripts/drawio2png.mjs` receives it under MPL-2.0, together with this NOTICE,
+the README.md license section, and the notice header inside that file.
+
+WHERE THE SOURCE CODE FORM IS.
+* JavaScript converter & modified wasm-bindgen glue (MPL-2.0 sections 1.10(b),
+  1.13, 3.1): `scripts/drawio2png.mjs` as shipped in this repository /
+  distribution archive is itself the Source Code Form. It is readable,
+  unobfuscated, uncompressed JavaScript, so no separate download is needed to
+  obtain the JavaScript Source Code Form or this project's modifications.
+* Embedded WebAssembly binary (`EMBEDDED_RESVG_WASM_B64`, `index_bg.wasm` from
+  `@resvg/resvg-wasm@2.6.2`, MPL-2.0 sections 1.6, 3.2): `index_bg.wasm` is an
+  unmodified compiled WebAssembly build artifact (Executable Form), not Source
+  Code Form. Pursuant to MPL-2.0 section 3.2, the corresponding upstream
+  Rust/WebAssembly Source Code Form (together with the unmodified upstream
+  JavaScript glue of that version) is available at
+  https://github.com/thx/resvg-js/tree/v2.6.2 (npm `@resvg/resvg-wasm@2.6.2`),
+  and the full MPL-2.0 text at https://www.mozilla.org/en-US/MPL/2.0/.
+
+--------------------------------------------------------------------------------
+THIRD-PARTY MATERIAL EMBEDDED IN `scripts/drawio2png.mjs`
+--------------------------------------------------------------------------------
+
+The attribution and additional terms below travel with
+`scripts/drawio2png.mjs`. They identify where the embedded material comes from;
+the embedded assets continue to be governed by their own licenses and this
+project does not relicense them.
 
 1. draw.io — https://github.com/jgraph/drawio/tree/v29.6.6 (tag v29.6.6)
    and draw.io Desktop — https://github.com/jgraph/drawio-desktop
@@ -41,35 +91,20 @@ software and stencil/shape assets derived from:
    `new WebAssembly.Module/Instance`, feeding the result into the glue's
    `__wbg_finalize_init`; the module wrapper was unwrapped and the glue was
    renamed to internal converter symbols. The original unused fetch/file-
-   loading glue lines are otherwise retained verbatim.
+   loading glue lines are otherwise retained verbatim. These modifications
+   remain under MPL-2.0 and this project does not relicense them.
 
-   SCOPE OF THE MPL-2.0 COVERED SOFTWARE. Inside `scripts/drawio2png.mjs` the
-   MPL-2.0 part is delimited by the two comment markers
+   Inside `scripts/drawio2png.mjs` the two comment markers
 
-       // BEGIN MPL-2.0 COVERED SOFTWARE (@resvg/resvg-wasm v2.6.2)
-       // END MPL-2.0 COVERED SOFTWARE (@resvg/resvg-wasm v2.6.2)
+       // BEGIN MPL-2.0 UPSTREAM CODE (@resvg/resvg-wasm v2.6.2)
+       // END MPL-2.0 UPSTREAM CODE (@resvg/resvg-wasm v2.6.2)
 
-   Everything between those markers (the base64-encoded, unmodified
-   `index_bg.wasm` and the wasm-bindgen JavaScript glue adapted for
-   synchronous initialization) is MPL-2.0 covered software. These
-   modifications remain under MPL-2.0 and this project does not relicense them.
-
-   WHERE THE SOURCE CODE FORM OF THE MODIFIED VERSION IS AVAILABLE. The
-   modified Source Code Form is distributed with this product: the block
-   between the BEGIN / END markers inside `scripts/drawio2png.mjs` -- this very
-   file, as shipped in this repository / distribution archive -- is itself the
-   Source Code Form of the modified glue. It is readable, unobfuscated,
-   uncompressed JavaScript, so no additional download is needed to obtain the
-   modified version. The unmodified upstream Source Code Form of the same
-   version remains available at
-   https://github.com/thx/resvg-js/tree/v2.6.2 (npm `@resvg/resvg-wasm@2.6.2`),
-   and the full MPL-2.0 text at https://www.mozilla.org/en-US/MPL/2.0/.
-
-   `scripts/drawio2png.mjs` as a whole is therefore a Larger Work / Combined
-   distribution in the sense of MPL-2.0 section 3.3: the Apache-2.0 part (the
-   wrapper / converter code and the draw.io assets described under item 1) and
-   the MPL-2.0 part described above are distributed together in one file, and
-   each part continues to be governed by its own license.
+   point at where that upstream material (the unmodified base64 of the
+   `index_bg.wasm` Executable Form and the adapted JS glue) lives. They are
+   provenance notes, not license boundaries: the MPL-2.0 covers the whole file;
+   the whole file is the Source Code Form of the modified JS glue (section 3.1),
+   while the upstream Rust/WebAssembly Source Code Form for `index_bg.wasm`
+   lives at the upstream URL above (section 3.2).
 
 ================================================================================
 ADDITIONAL TERMS FOR ICON SETS AND STENCIL LIBRARIES
